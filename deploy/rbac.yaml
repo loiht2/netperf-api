@@ -1,0 +1,48 @@
+---
+# Namespace that hosts both the DaemonSet and the API server.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: netperf-api
+
+---
+# ServiceAccount used by the API server pod.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: netperf-api-sa
+  namespace: netperf-api
+
+---
+# ClusterRole grants the minimum permissions required by the executor:
+#   - nodes          : discover Ready nodes and their InternalIPs
+#   - pods           : locate the iperf3 DaemonSet pod running on each node
+#   - pods/exec      : exec into those pods (the SPDY upgrade target)
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: netperf-api-role
+rules:
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["pods/exec"]
+    verbs: ["create"]   # "create" is the verb required for the exec subresource
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: netperf-api-binding
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: netperf-api-role
+subjects:
+  - kind: ServiceAccount
+    name: netperf-api-sa
+    namespace: netperf-api

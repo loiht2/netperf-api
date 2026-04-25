@@ -1,0 +1,106 @@
+---
+# iperf3 server DaemonSet — one pod per node.
+#
+# hostNetwork: true is essential: the pod binds to the node's IP (not the
+# pod overlay IP), so the iperf3 client can reach it via the node's
+# InternalIP that the executor discovers from the Node object.
+#
+# tolerations: - operator: Exists  ensures the pod runs on control-plane
+# nodes too, giving us a complete N-node mesh.
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: iperf3-server
+  namespace: netperf-api
+  labels:
+    app: iperf3-server
+spec:
+  selector:
+    matchLabels:
+      app: iperf3-server
+  updateStrategy:
+    type: RollingUpdate
+  template:
+    metadata:
+      labels:
+        app: iperf3-server
+    spec:
+      # Share the host network namespace so iperf3 listens on the node IP.
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+
+      # Tolerate every taint — we want coverage on all nodes.
+      tolerations:
+        - operator: Exists
+
+      terminationGracePeriodSeconds: 5
+
+      # emptyDir at /tmp gives iperf3 a writable scratch space while keeping
+      # the rest of the root filesystem read-only (readOnlyRootFilesystem: true).
+      # iperf3 --bidir creates temporary stream files in /tmp; without this
+      # mount the exec fails with "unable to create a new stream: Read-only
+      # file system".
+      volumes:
+        - name: tmp
+          emptyDir: {}
+
+      containers:
+        - name: iperf3
+          # networkstatic/iperf3 is a minimal Alpine-based image (~10 MB).
+          # Pin to a specific digest in production for supply-chain safety.
+          image: docker.io/networkstatic/iperf3:latest
+          imagePullPolicy: IfNotPresent
+          command: ["iperf3", "--server", "--forceflush"]
+          # --forceflush flushes output after every interval — useful for
+          # live log tailing; has no effect on the JSON throughput figures.
+
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+
+          ports:
+            - name: iperf3-tcp
+              containerPort: 5201
+              hostPort: 5201
+              protocol: TCP
+            - name: iperf3-udp
+              containerPort: 5201
+              hostPort: 5201
+              protocol: UDP
+
+          resources:
+            requests:
+              cpu: "1000m"
+              memory: "256Mi"
+            limits:
+              cpu: "1000m"
+              memory: "256Mi"
+
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: false   # iperf3 needs to bind to port 5201 on host network
+
+          # Liveness: verify the iperf3 binary is intact and responsive.
+          #
+          # *** DO NOT use tcpSocket probes here ***
+          # A tcpSocket probe makes a raw TCP connection to port 5201 and
+          # immediately closes it.  iperf3 treats that as a partial client
+          # handshake, logs "unable to receive parameters from client: Bad
+          # file descriptor", and may corrupt the next real measurement's
+          # stream.  An exec probe runs inside the container and never
+          # touches the listening socket.
+          livenessProbe:
+            exec:
+              command: ["iperf3", "--version"]
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            failureThreshold: 3
+
+          # Readiness: same reasoning — exec only, no TCP probe.
+          readinessProbe:
+            exec:
+              command: ["iperf3", "--version"]
+            initialDelaySeconds: 3
+            periodSeconds: 5
+            failureThreshold: 2

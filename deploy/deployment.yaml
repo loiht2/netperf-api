@@ -1,0 +1,78 @@
+---
+# API server Deployment — single replica is sufficient; all state is in-memory.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: netperf-api
+  namespace: netperf-api
+  labels:
+    app: netperf-api
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: netperf-api
+  template:
+    metadata:
+      labels:
+        app: netperf-api
+    spec:
+      serviceAccountName: netperf-api-sa   # mounts the token that client-go uses
+
+      containers:
+        - name: netperf-api
+          # Build and push this image before applying:
+          #   docker build -t netperf-api:latest .
+          #   kind load docker-image netperf-api:latest   # or push to a registry
+          image: docker.io/loihoangthanh1411/netperf-api:v0.4 
+          imagePullPolicy: IfNotPresent
+
+          ports:
+            - containerPort: 8080
+
+          env:
+            # Override to match your cluster's worker-node label scheme.
+            # kubeadm:  node-role.kubernetes.io/worker=true
+            # GKE:      cloud.google.com/gke-nodepool=<pool-name>
+            # EKS:      eks.amazonaws.com/nodegroup=<group-name>
+            # To target ALL nodes (including control-plane), set this to "".
+            - name: WORKER_NODE_LABEL
+              value: "node-role.kubernetes.io/worker=true"
+
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "500m"
+              memory: "256Mi"
+
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 3
+            periodSeconds: 5
+
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+
+---
+# ClusterIP Service — use `kubectl port-forward` or an Ingress to reach it.
+apiVersion: v1
+kind: Service
+metadata:
+  name: netperf-api
+  namespace: netperf-api
+spec:
+  selector:
+    app: netperf-api
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8080
+  type: ClusterIP
