@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"strconv"
 	"sync"
 	"time"
 
@@ -46,11 +47,13 @@ const (
 
 	// defaultWorkerLabel is the node label selector used to exclude control-plane
 	// nodes from the measurement pool.  Override via the WORKER_NODE_LABEL env var.
-	// Common values:
-	//   kubeadm clusters  : "node-role.kubernetes.io/worker=true"
-	//   GKE               : "cloud.google.com/gke-nodepool"   (key-only)
-	//   EKS               : "eks.amazonaws.com/nodegroup"     (key-only)
 	defaultWorkerLabel = "node-role.kubernetes.io/worker=true"
+
+	// defaultServerPort is the iperf3 listener port (iperf3's own default).
+	// Override via IPERF3_PORT to avoid conflicts when another iperf3 instance
+	// already occupies 5201 on the same hosts (e.g. during e2e tests run alongside
+	// a production DaemonSet).
+	defaultServerPort = 5201
 )
 
 // workerNodeLabel returns the label selector used to filter worker nodes.
@@ -63,10 +66,25 @@ func workerNodeLabel() string {
 	return defaultWorkerLabel
 }
 
+// iperf3ServerPort returns the TCP port the iperf3 server DaemonSet is
+// listening on. Reads IPERF3_PORT so integration tests can use an alternate
+// port (e.g. 5202) without conflicting with a production DaemonSet on 5201.
+func iperf3ServerPort() int {
+	if p := os.Getenv("IPERF3_PORT"); p != "" {
+		if n, err := strconv.Atoi(p); err == nil && n > 0 && n < 65536 {
+			return n
+		}
+	}
+	return defaultServerPort
+}
+
 // BandwidthEntry holds the measured bandwidth for a single directed link.
+// Error is non-empty when this specific pair failed; the consumer can detect
+// partial failures without the whole matrix being discarded.
 type BandwidthEntry struct {
-	MbpsIngress float64 `json:"mbps_ingress"` // bandwidth received (remote → this node)
-	MbpsEgress  float64 `json:"mbps_egress"`  // bandwidth sent (this node → remote)
+	MbpsIngress float64 `json:"mbps_ingress,omitempty"` // bandwidth received (remote → this node)
+	MbpsEgress  float64 `json:"mbps_egress,omitempty"`  // bandwidth sent (this node → remote)
+	Error       string  `json:"error,omitempty"`        // non-empty when this pair failed
 }
 
 // pairResult captures all throughput figures from a single --bidir iperf3 exec.
@@ -103,6 +121,14 @@ func New(c *k8sclient.Client) *Executor {
 // without touching the production "netperf" namespace.
 func NewForNamespace(c *k8sclient.Client, ns string) *Executor {
 	return &Executor{client: c, namespace: ns}
+}
+
+// CountReadyNodes returns the number of Ready worker nodes visible to the
+// executor. Used by the API handler to compute an ETA before the measurement
+// goroutine is launched.
+func (e *Executor) CountReadyNodes(ctx context.Context) (int, error) {
+	ips, _, err := e.readyNodeIPs(ctx)
+	return len(ips), err
 }
 
 // Run is the entry point called from a background goroutine.
@@ -196,6 +222,8 @@ func (e *Executor) run(ctx context.Context) (*Result, error) {
 
 		// Merge into matrix (sequential after wg.Wait — no races).
 		// Each --bidir exec yields two directed entries from one measurement.
+		// Errors are ALWAYS written into the matrix so callers can see exactly
+		// which pair failed and why — never silently skipped.
 		for _, pr := range roundResults {
 			log.Printf("[executor] pair %s→%s: egress=%.1f ingress=%.1f revEgress=%.1f revIngress=%.1f err=%q",
 				pr.Source, pr.Target,
@@ -203,6 +231,8 @@ func (e *Executor) run(ctx context.Context) (*Result, error) {
 				pr.ReverseEgressMbps, pr.ReverseIngressMbps,
 				pr.Error)
 			if pr.Error != "" {
+				matrix[pr.Source][pr.Target] = &BandwidthEntry{Error: pr.Error}
+				matrix[pr.Target][pr.Source] = &BandwidthEntry{Error: pr.Error}
 				continue
 			}
 			matrix[pr.Source][pr.Target] = &BandwidthEntry{
@@ -216,8 +246,9 @@ func (e *Executor) run(ctx context.Context) (*Result, error) {
 		}
 
 		// Mandatory cooldown between rounds (skip after the final round).
-		// Use select so a DELETE /cancel unblocks immediately instead of
-		// waiting up to 5 s for the sleep to expire naturally.
+		// select gives the full 5 s pause between rounds while still unblocking
+		// immediately when the context is cancelled (e.g. DELETE /cancel).
+		// Pair-level failures do NOT skip or shorten this cooldown.
 		if roundIdx < len(sched)-1 {
 			log.Printf("[executor] cooldown %v before next round", roundCooldown)
 			select {
@@ -237,11 +268,15 @@ func (e *Executor) run(ctx context.Context) (*Result, error) {
 // execPair runs `iperf3 -c <Target> -t 10 --bidir -J` inside the source pod
 // and returns a pairResult containing throughput for both directed links.
 //
-// Field mapping from iperf3 3.12 --bidir JSON (measured at the client/source):
-//   sum_sent                  → source→target sender stats   (EgressMbps)
-//   sum_received              → target→source receiver stats (IngressMbps)
-//   sum_sent_bidir_reverse    → target→source sender stats   (ReverseEgressMbps)
-//   sum_received_bidir_reverse→ source→target receiver stats (ReverseIngressMbps)
+// Every failure path sets pr.Error so the caller can write a diagnostic entry
+// into the matrix — no error is ever silently swallowed or converted to zeros.
+//
+// Field mapping from iperf3 --bidir JSON (measured at the client/source pod):
+//
+//	end.sum_sent                   → EgressMbps         (source→target sender)
+//	end.sum_received               → IngressMbps        (source←target receiver)
+//	end.sum_sent_bidir_reverse     → ReverseEgressMbps  (target→source sender)
+//	end.sum_received_bidir_reverse → ReverseIngressMbps (target←source receiver)
 func (e *Executor) execPair(ctx context.Context, p scheduler.Pair, nodePods map[string]string) pairResult {
 	pr := pairResult{Source: p.Source, Target: p.Target}
 
@@ -251,9 +286,11 @@ func (e *Executor) execPair(ctx context.Context, p scheduler.Pair, nodePods map[
 		return pr
 	}
 
+	port := iperf3ServerPort()
 	cmd := []string{
 		"iperf3",
 		"-c", p.Target,
+		"-p", strconv.Itoa(port),
 		"-t", fmt.Sprintf("%d", IperfDuration),
 		"--bidir",
 		"-J", // JSON output
@@ -262,28 +299,53 @@ func (e *Executor) execPair(ctx context.Context, p scheduler.Pair, nodePods map[
 	stdout, stderr, execErr := e.podExec(ctx, srcPod, cmd)
 	log.Printf("[executor] pair %s→%s: stdout=%d bytes stderr=%d bytes err=%v",
 		p.Source, p.Target, len(stdout), len(stderr), execErr)
+	// Log the raw stdout unconditionally so pod logs always show what iperf3
+	// actually returned — crucial for diagnosing JSON mapping failures.
+	log.Printf("[executor] pair %s→%s: raw stdout:\n%s", p.Source, p.Target, stdout)
 
-	// iperf3 with -J writes a JSON document even on failure (it embeds the
-	// error message in the "error" field).  Parse regardless of execErr.
-	if len(stdout) > 0 {
-		out, parseErr := iperf3.Parse([]byte(stdout))
-		if parseErr == nil {
-			if out.Error != "" {
-				pr.Error = fmt.Sprintf("iperf3 reported: %s", out.Error)
-				return pr
-			}
-			pr.EgressMbps         = iperf3.BitsToMbps(out.End.SumSent.BitsPerSecond)
-			pr.IngressMbps        = iperf3.BitsToMbps(out.End.SumReceived.BitsPerSecond)
-			pr.ReverseEgressMbps  = iperf3.BitsToMbps(out.End.SumSentBidirReverse.BitsPerSecond)
-			pr.ReverseIngressMbps = iperf3.BitsToMbps(out.End.SumRecvBidirReverse.BitsPerSecond)
-			return pr
+	// No stdout at all — surface whatever exec-level error we have.
+	if len(stdout) == 0 {
+		if execErr != nil {
+			pr.Error = fmt.Sprintf("exec failed (no output): %v | stderr: %s", execErr, stderr)
+		} else {
+			pr.Error = "iperf3 produced no output"
 		}
+		return pr
 	}
 
-	// If stdout was empty or unparseable, surface the exec-level error.
-	if execErr != nil {
-		pr.Error = fmt.Sprintf("exec failed: %v | stderr: %s", execErr, stderr)
+	// iperf3 -J writes a JSON document even on connection failure (it embeds
+	// the reason in the top-level "error" field).  extractJSON inside Parse
+	// strips any warning lines that precede the opening '{'.
+	out, parseErr := iperf3.Parse([]byte(stdout))
+	if parseErr != nil {
+		// JSON parse failed — include as much diagnostic context as possible.
+		if execErr != nil {
+			pr.Error = fmt.Sprintf("JSON parse failed: %v | exec error: %v | stderr: %s",
+				parseErr, execErr, stderr)
+		} else {
+			pr.Error = fmt.Sprintf("JSON parse failed: %v | raw stdout: %.300s",
+				parseErr, stdout)
+		}
+		return pr
 	}
+
+	// iperf3 itself reported an error (e.g. "Connection refused").
+	if out.Error != "" {
+		pr.Error = fmt.Sprintf("iperf3 reported: %s", out.Error)
+		return pr
+	}
+
+	// Tolerant bidir extraction — missing fields return 0, not a parse error.
+	bidir, bidirErr := iperf3.ParseEnd(out.End)
+	if bidirErr != nil {
+		pr.Error = fmt.Sprintf("bidir parse failed: %v", bidirErr)
+		return pr
+	}
+
+	pr.EgressMbps         = iperf3.BitsToMbps(bidir.FwdSentBps)
+	pr.IngressMbps        = iperf3.BitsToMbps(bidir.FwdRecvBps)
+	pr.ReverseEgressMbps  = iperf3.BitsToMbps(bidir.RevSentBps)
+	pr.ReverseIngressMbps = iperf3.BitsToMbps(bidir.RevRecvBps)
 	return pr
 }
 

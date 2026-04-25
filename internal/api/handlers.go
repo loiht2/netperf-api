@@ -10,6 +10,7 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -20,8 +21,10 @@ import (
 
 // Handler wires the HTTP layer to the task store and executor.
 type Handler struct {
-	store    *store.Store
-	executor *executor.Executor
+	store     *store.Store
+	executor  *executor.Executor
+	mu        sync.Mutex // guards isRunning
+	isRunning bool       // true while a measurement goroutine is active
 }
 
 // New creates a Handler.
@@ -46,14 +49,47 @@ func (h *Handler) healthz(w http.ResponseWriter, _ *http.Request) {
 // startMeasure handles POST /api/v1/network-measure.
 //
 // Flow:
-//  1. Generate a UUID task_id and record the task as "pending".
-//  2. Create a cancellable context and store its CancelFunc under the task_id
+//  1. Acquire the global lock; reject with 409 if a measurement is already running.
+//  2. Count ready worker nodes for an ETA estimate.
+//  3. Generate a UUID task_id and record the task as "pending".
+//  4. Create a cancellable context and store its CancelFunc under the task_id
 //     so the DELETE handler can abort it later.
-//  3. Launch the executor in a background goroutine (non-blocking).
-//  4. Return 202 Accepted immediately.
+//  5. Launch the executor in a background goroutine that releases the lock on exit.
+//  6. Return 202 Accepted with task_id and estimated_duration_seconds.
 func (h *Handler) startMeasure(w http.ResponseWriter, r *http.Request) {
-	taskID := uuid.New().String()
+	// ── Global execution lock ────────────────────────────────────────────────
+	h.mu.Lock()
+	if h.isRunning {
+		h.mu.Unlock()
+		writeJSON(w, http.StatusConflict, map[string]interface{}{
+			"error":  "A network measurement is already in progress. Please try again later.",
+			"status": "conflict",
+		})
+		return
+	}
+	h.isRunning = true
+	h.mu.Unlock()
 
+	// ── ETA estimate ─────────────────────────────────────────────────────────
+	// Count nodes now (fast list call) so we can tell the caller how long to wait.
+	// On error nNodes = 0 → estimatedSeconds = 0 (safe: executor will report the
+	// real failure once it runs).
+	nodeCtx, nodeCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer nodeCancel()
+	nNodes, _ := h.executor.CountReadyNodes(nodeCtx)
+
+	var rounds int
+	if nNodes > 0 {
+		if nNodes%2 == 0 {
+			rounds = nNodes - 1
+		} else {
+			rounds = nNodes
+		}
+	}
+	estimatedSeconds := rounds * (executor.IperfDuration + 5) // 10s test + 5s cooldown
+
+	// ── Task registration ─────────────────────────────────────────────────────
+	taskID := uuid.New().String()
 	task := &store.Task{
 		ID:        taskID,
 		Status:    store.StatusPending,
@@ -67,9 +103,21 @@ func (h *Handler) startMeasure(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithCancel(context.Background())
 	h.store.SetCancel(taskID, cancel)
 
-	go h.executor.Run(ctx, taskID, h.store)
+	go func() {
+		defer func() {
+			h.mu.Lock()
+			h.isRunning = false
+			h.mu.Unlock()
+		}()
+		h.executor.Run(ctx, taskID, h.store)
+	}()
 
-	writeJSON(w, http.StatusAccepted, map[string]string{"task_id": taskID})
+	writeJSON(w, http.StatusAccepted, map[string]interface{}{
+		"task_id":                    taskID,
+		"status":                     "accepted",
+		"estimated_duration_seconds": estimatedSeconds,
+		"message":                    "Measurement started. Please poll the GET endpoint.",
+	})
 }
 
 // getMeasure handles GET /api/v1/network-measure/{task_id}.

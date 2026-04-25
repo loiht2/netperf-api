@@ -24,6 +24,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"testing"
 	"time"
 
@@ -119,15 +120,16 @@ func createIsolatedNamespace(t *testing.T, cs kubernetes.Interface) string {
 }
 
 // deployIperf3DaemonSet creates the iperf3 server DaemonSet inside the given
-// namespace. Resource requests are intentionally lower than production so the
-// test can run on modest clusters.
+// namespace listening on the specified port. Using a non-default port (e.g. 5202)
+// avoids conflicts when a production DaemonSet already occupies 5201 on the same
+// hosts (hostNetwork means all DaemonSets share the node's network namespace).
 //
 // Key design choices mirrored from the production DaemonSet:
-//   - hostNetwork: true       — server binds to the node's InternalIP on :5201
+//   - hostNetwork: true       — server binds to the node's InternalIP on :<port>
 //   - tolerations: Exists     — runs on control-plane nodes too (maximises N)
 //   - exec liveness probe     — avoids the "Bad file descriptor" bug caused by
-//     kubelet TCP probes hitting port 5201 and closing without handshaking
-func deployIperf3DaemonSet(t *testing.T, cs kubernetes.Interface, namespace string) {
+//     kubelet TCP probes hitting the port and closing without handshaking
+func deployIperf3DaemonSet(t *testing.T, cs kubernetes.Interface, namespace string, port int) {
 	t.Helper()
 
 	allowPrivEscalation := false
@@ -177,7 +179,7 @@ func deployIperf3DaemonSet(t *testing.T, cs kubernetes.Interface, namespace stri
 							Name:            "iperf3",
 							Image:           "docker.io/networkstatic/iperf3:latest",
 							ImagePullPolicy: corev1.PullIfNotPresent,
-							Command:         []string{"iperf3", "--server", "--forceflush"},
+							Command:         []string{"iperf3", "--server", "--forceflush", "-p", strconv.Itoa(port)},
 
 							VolumeMounts: []corev1.VolumeMount{
 								{Name: "tmp", MountPath: "/tmp"},
@@ -313,9 +315,12 @@ func TestE2E_FullMeasurementCycle(t *testing.T) {
 	// Kubernetes node since v1.14.
 	const nodeLabel = "kubernetes.io/os=linux"
 
-	// Redirect WORKER_NODE_LABEL so executor.readyNodeIPs picks up all nodes.
-	// t.Setenv restores the original value automatically after the test.
+	// Use port 5202 so the test DaemonSet does not conflict with a production
+	// iperf3-server DaemonSet that may already be listening on the default 5201.
+	// IPERF3_PORT is read by executor.iperf3ServerPort() and restored by t.Setenv.
+	const testPort = 5202
 	t.Setenv("WORKER_NODE_LABEL", nodeLabel)
+	t.Setenv("IPERF3_PORT", strconv.Itoa(testPort))
 
 	client, cs := buildClient(t)
 
@@ -331,7 +336,7 @@ func TestE2E_FullMeasurementCycle(t *testing.T) {
 	ns := createIsolatedNamespace(t, cs)
 
 	// ── Deploy & wait ────────────────────────────────────────────────────────
-	deployIperf3DaemonSet(t, cs, ns)
+	deployIperf3DaemonSet(t, cs, ns, testPort)
 
 	// Allow up to 5 minutes for image pulls + container starts.
 	waitCtx, waitCancel := context.WithTimeout(context.Background(), 5*time.Minute)
@@ -412,7 +417,9 @@ func TestE2E_FullMeasurementCycle(t *testing.T) {
 // measurement is running cleanly aborts the goroutine and sets status=canceled.
 func TestE2E_CancelMidFlight(t *testing.T) {
 	const nodeLabel = "kubernetes.io/os=linux"
+	const testPort = 5202
 	t.Setenv("WORKER_NODE_LABEL", nodeLabel)
+	t.Setenv("IPERF3_PORT", strconv.Itoa(testPort))
 
 	client, cs := buildClient(t)
 
@@ -422,7 +429,7 @@ func TestE2E_CancelMidFlight(t *testing.T) {
 	}
 
 	ns := createIsolatedNamespace(t, cs)
-	deployIperf3DaemonSet(t, cs, ns)
+	deployIperf3DaemonSet(t, cs, ns, testPort)
 
 	waitCtx, waitCancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer waitCancel()
