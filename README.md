@@ -61,6 +61,7 @@ sequenceDiagram
 | **Circle-method scheduling** | Each node appears in at most one active pair per round — maximises parallelism without creating bandwidth bottlenecks |
 | **Exec probes (not TCP socket probes)** | TCP socket probes half-open to port 5201 and immediately close, causing iperf3 `Bad file descriptor` errors in server logs |
 | **`emptyDir` on `/tmp`** | iperf3 `--bidir` creates temporary stream state files under `/tmp`. A read-only root filesystem requires an explicit writable volume mount there |
+| **Fast-Retry per pair (1×10 s + 3×5 s)** | Tailscale reconnect events sever the API-server ↔ Kubelet SPDY leg gracefully (TCP FIN → EOF, not error). iperf3 `-J` buffers all output, so a mid-test stream close yields 0 bytes with `err=nil`. The retry loop detects this and re-runs the pair on the recovered link |
 
 ---
 
@@ -140,7 +141,7 @@ rounds = N − 1  (N even)   or   N  (N odd)
 estimated_duration_seconds = rounds × 15
 ```
 
-The 15-second-per-round constant is: **10 s** (`iperf3 -t 10`) + **5 s** (inter-round cooldown).
+The 15-second-per-round constant is: **10 s** (`iperf3 -t 10`, initial attempt) + **5 s** (inter-round cooldown). This is the happy-path estimate. In the event of transient SPDY stream failures, the Fast-Retry strategy may extend individual pair execution by up to ~35 s (3 retries × 8 s + 3 waits × 3 s), but since retries run concurrently with other pairs in the same round the wall-clock impact is bounded by the slowest pair in each round.
 
 ---
 

@@ -97,7 +97,7 @@ func (h *Handler) startMeasure(w http.ResponseWriter, r *http.Request) {
 			rounds = nNodes
 		}
 	}
-	estimatedSeconds := rounds * (executor.IperfDuration + 5) // 10 s test + 5 s cooldown
+	estimatedSeconds := rounds * (executor.IperfInitialDuration + 5) // 10 s test + 5 s cooldown
 
 	// ── Task registration ─────────────────────────────────────────────────────
 	taskID := uuid.New().String()

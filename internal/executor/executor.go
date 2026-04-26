@@ -36,14 +36,31 @@ const (
 	// ContainerName is the container inside each DaemonSet pod.
 	ContainerName = "iperf3"
 
-	// IperfDuration is the seconds passed to iperf3 -t.
-	IperfDuration = 10
+	// IperfInitialDuration is the iperf3 -t value (seconds) for the first attempt.
+	// Exported so the API handler can compute the happy-path ETA.
+	IperfInitialDuration = 10
+
+	// iperfRetryDuration is the iperf3 -t value (seconds) for retry attempts 2–4.
+	// Shorter to recover quickly after a transient SPDY stream interruption.
+	iperfRetryDuration = 5
+
+	// iperfInitialTimeout is the per-attempt context deadline for the first attempt:
+	// full 10 s test + generous margin for SPDY negotiation and teardown.
+	iperfInitialTimeout = 15 * time.Second
+
+	// iperfRetryTimeout is the per-attempt context deadline for retry attempts:
+	// 5 s test + 3 s margin.
+	iperfRetryTimeout = 8 * time.Second
+
+	// retryWait is the fixed pause between consecutive attempts for the same pair.
+	// Long enough for the Tailscale reconnect to stabilise before we retry.
+	retryWait = 3 * time.Second
+
+	// maxAttempts is the total number of exec attempts per pair (1 initial + 3 retries).
+	maxAttempts = 4
 
 	// roundCooldown is the mandatory pause between rounds to let TCP state drain.
 	roundCooldown = 5 * time.Second
-
-	// pairTimeout caps a single iperf3 exec: test duration + generous overhead.
-	pairTimeout = 90 * time.Second
 
 	// defaultServerPort is the iperf3 listener port (iperf3's own default).
 	// Override via IPERF3_PORT to avoid conflicts when another iperf3 instance
@@ -286,10 +303,9 @@ func (e *Executor) run(ctx context.Context, snapshot *NodeSnapshot) (*Result, er
 			wg.Add(1)
 			go func(idx int, p scheduler.Pair) {
 				defer wg.Done()
-				// Give each individual exec its own tight deadline.
-				pairCtx, cancel := context.WithTimeout(ctx, pairTimeout)
-				defer cancel()
-				roundResults[idx] = e.execPair(pairCtx, p, snapshot.PodNames)
+				// execPair manages its own per-attempt timeouts internally.
+				// Pass the task context directly so DELETE cancellation propagates.
+				roundResults[idx] = e.execPair(ctx, p, snapshot.PodNames)
 			}(pairIdx, pair)
 		}
 
@@ -336,19 +352,28 @@ func (e *Executor) run(ctx context.Context, snapshot *NodeSnapshot) (*Result, er
 	}, nil
 }
 
-// execPair runs `iperf3 -c <Target> -t 10 --bidir -J` inside the source pod
-// and returns a pairResult containing the two receiver-side throughput values
-// — one for each direction of the link.
+// execPair runs iperf3 inside the source pod and returns a pairResult with the
+// two receiver-side throughput values — one per direction of the link.
 //
-// Every failure path sets pr.Error so the caller can write a diagnostic entry
-// into the matrix — no error is ever silently swallowed or converted to zeros.
+// Retry strategy (resilient to transient SPDY stream interruptions):
+//
+//	Attempt 1 : iperf3 -t 10, per-attempt timeout 15 s
+//	Attempts 2–4 : iperf3 -t  5, per-attempt timeout  8 s
+//	Between attempts: 3 s context-aware wait
+//
+// The root cause of transient 0-byte output is a Tailscale reconnect event
+// that severs the API-server ↔ Kubelet SPDY leg mid-test. The API server
+// performs a graceful TCP FIN, which client-go's spdystream interprets as a
+// clean EOF → nil error. iperf3 -J buffers all output until test completion,
+// so a severed stream yields stdout="" with err=nil. The shorter retry
+// duration lets the pair recover before the round cooldown expires.
+//
+// Every failure path sets pr.Error explicitly — no error is silently swallowed.
 //
 // Field mapping from iperf3 --bidir JSON:
 //
-//	end.sum_received               → ToTargetMbps  (target's receiver-side count
-//	                                                 of the source→target stream)
-//	end.sum_received_bidir_reverse → ToSourceMbps  (source's receiver-side count
-//	                                                 of the target→source stream)
+//	end.sum_received               → ToTargetMbps
+//	end.sum_received_bidir_reverse → ToSourceMbps
 func (e *Executor) execPair(ctx context.Context, p scheduler.Pair, nodePods map[string]string) pairResult {
 	pr := pairResult{Source: p.Source, Target: p.Target}
 
@@ -359,65 +384,100 @@ func (e *Executor) execPair(ctx context.Context, p scheduler.Pair, nodePods map[
 	}
 
 	port := iperf3ServerPort()
-	cmd := []string{
-		"iperf3",
-		"-c", p.Target,
-		"-p", strconv.Itoa(port),
-		"-t", fmt.Sprintf("%d", IperfDuration),
-		"--bidir",
-		"-J", // JSON output
-	}
+	var lastErr string
 
-	stdout, stderr, execErr := e.podExec(ctx, srcPod, cmd)
-	// Concise envelope log — sizes only, never raw payload, to keep log
-	// volume bounded. Raw stdout is only emitted on parse failure below.
-	log.Printf("[executor] pair %s→%s: stdout=%d bytes stderr=%d bytes err=%v",
-		p.Source, p.Target, len(stdout), len(stderr), execErr)
-
-	// No stdout at all — surface whatever exec-level error we have.
-	if len(stdout) == 0 {
-		if execErr != nil {
-			pr.Error = fmt.Sprintf("exec failed (no output): %v | stderr: %s", execErr, stderr)
-		} else {
-			pr.Error = "iperf3 produced no output"
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		// Inter-attempt wait (skip before the first attempt).
+		if attempt > 1 {
+			prevDuration := IperfInitialDuration
+			if attempt > 2 {
+				prevDuration = iperfRetryDuration
+			}
+			log.Printf("[Pair %s<->%s] Attempt %d/%d (%ds) failed: %s. Retrying (Attempt %d/%d, %ds)...",
+				p.Source, p.Target, attempt-1, maxAttempts, prevDuration, lastErr,
+				attempt, maxAttempts, iperfRetryDuration)
+			select {
+			case <-time.After(retryWait):
+			case <-ctx.Done():
+				pr.Error = fmt.Sprintf("cancelled before attempt %d: %v", attempt, ctx.Err())
+				return pr
+			}
 		}
-		return pr
-	}
 
-	// iperf3 -J writes a JSON document even on connection failure (it embeds
-	// the reason in the top-level "error" field).  extractJSON inside Parse
-	// strips any warning lines that precede the opening '{'.
-	out, parseErr := iperf3.Parse([]byte(stdout))
-	if parseErr != nil {
-		// Parsing failed: dump the raw stdout to logs (this is the only path
-		// that emits raw iperf3 output, kept for debugging unexpected formats).
-		// Truncated to 4 KB to stay safe on log forwarders.
-		log.Printf("[executor] pair %s→%s: PARSE ERROR — raw stdout (truncated to 4KB):\n%.4096s",
-			p.Source, p.Target, stdout)
-		if execErr != nil {
-			pr.Error = fmt.Sprintf("JSON parse failed: %v | exec error: %v | stderr: %s",
-				parseErr, execErr, stderr)
-		} else {
-			pr.Error = fmt.Sprintf("JSON parse failed: %v", parseErr)
+		duration := IperfInitialDuration
+		timeout := iperfInitialTimeout
+		if attempt > 1 {
+			duration = iperfRetryDuration
+			timeout = iperfRetryTimeout
 		}
+
+		cmd := []string{
+			"iperf3",
+			"-c", p.Target,
+			"-p", strconv.Itoa(port),
+			"-t", strconv.Itoa(duration),
+			"--bidir",
+			"-J",
+		}
+
+		attemptCtx, attemptCancel := context.WithTimeout(ctx, timeout)
+		stdout, stderr, execErr := e.podExec(attemptCtx, srcPod, cmd)
+		attemptCancel()
+
+		log.Printf("[executor] pair %s→%s attempt %d/%d (%ds): stdout=%d bytes stderr=%d bytes err=%v",
+			p.Source, p.Target, attempt, maxAttempts, duration, len(stdout), len(stderr), execErr)
+
+		// Empty stdout — the SPDY stream closed before iperf3 flushed its JSON.
+		if len(stdout) == 0 {
+			if execErr != nil {
+				lastErr = fmt.Sprintf("exec failed (no output): %v | stderr: %s", execErr, stderr)
+			} else {
+				lastErr = "iperf3 produced no output (SPDY stream closed mid-test)"
+			}
+			// If the outer context was cancelled, stop immediately — no retry.
+			if ctx.Err() != nil {
+				pr.Error = fmt.Sprintf("cancelled during attempt %d: %v", attempt, ctx.Err())
+				return pr
+			}
+			continue
+		}
+
+		// extractJSON strips warning lines before the opening '{'.
+		out, parseErr := iperf3.Parse([]byte(stdout))
+		if parseErr != nil {
+			log.Printf("[executor] pair %s→%s attempt %d: PARSE ERROR — raw stdout (truncated to 4KB):\n%.4096s",
+				p.Source, p.Target, attempt, stdout)
+			if execErr != nil {
+				lastErr = fmt.Sprintf("JSON parse failed: %v | exec error: %v | stderr: %s", parseErr, execErr, stderr)
+			} else {
+				lastErr = fmt.Sprintf("JSON parse failed: %v", parseErr)
+			}
+			continue
+		}
+
+		// iperf3 itself reported an error (e.g. "Connection refused").
+		if out.Error != "" {
+			lastErr = fmt.Sprintf("iperf3 reported: %s", out.Error)
+			continue
+		}
+
+		// Tolerant bidir extraction — missing fields return 0, not a parse error.
+		bidir, bidirErr := iperf3.ParseEnd(out.End)
+		if bidirErr != nil {
+			lastErr = fmt.Sprintf("bidir parse failed: %v", bidirErr)
+			continue
+		}
+
+		// ── Success ──────────────────────────────────────────────────────────────
+		pr.ToTargetMbps = iperf3.BitsToMbps(bidir.ToTargetBps)
+		pr.ToSourceMbps = iperf3.BitsToMbps(bidir.ToSourceBps)
 		return pr
 	}
 
-	// iperf3 itself reported an error (e.g. "Connection refused").
-	if out.Error != "" {
-		pr.Error = fmt.Sprintf("iperf3 reported: %s", out.Error)
-		return pr
-	}
-
-	// Tolerant bidir extraction — missing fields return 0, not a parse error.
-	bidir, bidirErr := iperf3.ParseEnd(out.End)
-	if bidirErr != nil {
-		pr.Error = fmt.Sprintf("bidir parse failed: %v", bidirErr)
-		return pr
-	}
-
-	pr.ToTargetMbps = iperf3.BitsToMbps(bidir.ToTargetBps)
-	pr.ToSourceMbps = iperf3.BitsToMbps(bidir.ToSourceBps)
+	// All attempts exhausted.
+	log.Printf("[Pair %s<->%s] All %d attempts failed. Last error: %s",
+		p.Source, p.Target, maxAttempts, lastErr)
+	pr.Error = fmt.Sprintf("failed after %d attempts (network unstable): %s", maxAttempts, lastErr)
 	return pr
 }
 

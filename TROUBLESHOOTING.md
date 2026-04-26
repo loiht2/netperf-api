@@ -312,3 +312,61 @@ if parseErr != nil {
 The byte-size envelope log (`stdout=N bytes stderr=M bytes err=...`) is preserved on every pair — it confirms the exec ran and gives a baseline for diagnosing silent failures, without dumping any payload.
 
 **Result:** on a healthy run the executor now produces one structured line per pair (~120 bytes) instead of ~15 KB. Logs are searchable, forwarders are happy, and parse errors still surface the raw payload exactly when an operator needs it.
+
+---
+
+## Bug 7: Silent 0-byte Output — SPDY Stream Severed by Tailscale Mid-Test
+
+### Symptom
+
+Intermittently (not on every run, not on every pair), one or more matrix cells contain
+`{"mbps": 0, "error": "iperf3 produced no output (SPDY stream closed mid-test)"}` even though:
+
+- The source pod is `Running` and `PodReady=True`.
+- The target pod is responding to other pairs in the same round.
+- No other error appears in the executor logs for that pair — `err=nil` is logged.
+- The test eventually appears in the matrix on a subsequent measurement (it is not systematically broken).
+
+### Root cause
+
+Three conditions must coincide for this failure to occur:
+
+1. **Tailscale reconnect event.** Tailscale operates as an in-kernel WireGuard overlay. During a key-rotation or relay-fallback event it briefly tears down and re-establishes the WireGuard tunnel. This severs the underlying TCP session on the **API server ↔ Kubelet leg** of the exec path.
+
+2. **Graceful TCP FIN, not RST.** When the Kubernetes API server detects the Kubelet-side connection has dropped it performs a graceful SPDY teardown — it sends a SPDY stream-close (DATA frame with FIN, or GOAWAY) rather than letting the kernel emit a TCP RST. The `moby/spdystream` library inside `client-go` interprets a clean stream-close as EOF and returns `nil` from `StreamWithContext`. **This is the critical asymmetry**: SPDY stream lifetime does not map onto process success/failure. A graceful stream close and a successful iperf3 exit are indistinguishable from the client side.
+
+3. **`iperf3 -J` buffers all output.** Unlike plain iperf3 (which prints periodic interval lines), `-J` accumulates the full measurement in memory and writes the JSON document to stdout **only at test completion**. If the SPDY stream is torn down 5 seconds into a 10-second test, iperf3 has produced zero bytes to its stdout pipe yet. The iperf3 process may continue running inside the container and eventually write its JSON to the local pipe — but with the stream already closed, the output goes into a void. The executor's `bytes.Buffer` remains empty, and `execPair` receives `("", "", nil)`.
+
+This is why the condition is intermittent: it requires a Tailscale reconnect (not merely latency) that produces a graceful FIN (not an RST), timed within the iperf3 measurement window.
+
+### Fix
+
+**Fast-Retry strategy** in `execPair` (`internal/executor/executor.go`):
+
+| Attempt | `iperf3 -t` | Per-attempt context timeout | Wait before next |
+|---------|-------------|----------------------------|-----------------|
+| 1       | 10 s        | 15 s                       | —               |
+| 2       | 5 s         | 8 s                        | 3 s             |
+| 3       | 5 s         | 8 s                        | 3 s             |
+| 4       | 5 s         | 8 s                        | 3 s             |
+
+Rationale for the shorter retry duration: by the time a Tailscale reconnect has fired, the tunnel is typically re-established within 1–2 seconds. A 5-second iperf3 run is sufficient to confirm link health while keeping the total worst-case time for one pair under ~50 seconds (well within the round cooldown budget).
+
+Each attempt creates its own `context.WithTimeout` derived from the task-level context, so a DELETE cancellation still propagates immediately. If the outer context is cancelled between attempts, the retry loop exits without delay.
+
+Terminal failure message (all 4 attempts exhausted):
+
+```json
+{ "mbps": 0, "error": "failed after 4 attempts (network unstable): iperf3 produced no output (SPDY stream closed mid-test)" }
+```
+
+Log sequence for a pair that recovers on the third attempt:
+
+```
+[executor] pair 10.0.0.1→10.0.0.2 attempt 1/4 (10s): stdout=0 bytes stderr=0 bytes err=<nil>
+[Pair 10.0.0.1<->10.0.0.2] Attempt 1/4 (10s) failed: iperf3 produced no output (SPDY stream closed mid-test). Retrying (Attempt 2/4, 5s)...
+[executor] pair 10.0.0.1→10.0.0.2 attempt 2/4 (5s): stdout=0 bytes stderr=0 bytes err=<nil>
+[Pair 10.0.0.1<->10.0.0.2] Attempt 2/4 (5s) failed: iperf3 produced no output (SPDY stream closed mid-test). Retrying (Attempt 3/4, 5s)...
+[executor] pair 10.0.0.1→10.0.0.2 attempt 3/4 (5s): stdout=4821 bytes stderr=0 bytes err=<nil>
+[Round 2] 10.0.0.1→10.0.0.2 = 918.40 Mbps  |  10.0.0.2→10.0.0.1 = 904.12 Mbps
+```
