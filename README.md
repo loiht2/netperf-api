@@ -229,31 +229,36 @@ curl -s http://localhost:8080/api/v1/network-measure/3f2a1b4c-… | jq
     ],
     "matrix": {
       "192.168.40.209": {
-        "192.168.40.247": { "mbps_egress": 932.6, "mbps_ingress": 929.6 },
-        "192.168.40.246": { "mbps_egress": 918.5, "mbps_ingress": 915.5 }
+        "192.168.40.247": { "mbps": 931.5 },
+        "192.168.40.246": { "mbps": 894.9 }
       },
       "192.168.40.247": {
-        "192.168.40.209": { "mbps_egress": 924.4, "mbps_ingress": 921.5 },
-        "192.168.40.246": { "mbps_egress": 874.5, "mbps_ingress": 872.0 }
+        "192.168.40.209": { "mbps": 929.4 },
+        "192.168.40.246": { "mbps": 906.6 }
       },
       "192.168.40.246": {
-        "192.168.40.209": { "mbps_egress": 925.3, "mbps_ingress": 922.6 },
-        "192.168.40.247": { "mbps_egress": 928.2, "mbps_ingress": 925.6 }
+        "192.168.40.209": { "mbps": 892.9 },
+        "192.168.40.247": { "mbps": 904.4 }
       }
     }
   }
 }
 ```
 
-**Matrix schema:**
+**Matrix schema (True Directional N×N):**
 
-| Field | Meaning |
+| Element | Meaning |
 |---|---|
-| `matrix[src][tgt].mbps_egress` | Bandwidth *sent* by `src` toward `tgt` (Mbit/s) |
-| `matrix[src][tgt].mbps_ingress` | Bandwidth *received* by `src` from `tgt` (Mbit/s) |
-| `matrix[src][tgt].error` | Non-empty string when this specific pair failed; all other fields are absent |
+| `matrix[Source][Target]` | A `BandwidthData` cell describing the **single directed link** Source→Target |
+| `matrix[Source][Target].mbps` | Bandwidth (Mbit/s) that **`Target` successfully received from `Source`** |
+| `matrix[Source][Target].error` | Non-empty string when this specific directed link failed; `mbps` is then 0 |
 
-Every pair is populated from a single `--bidir` exec, so `matrix[A][B]` and `matrix[B][A]` are both written from one measurement round.
+Notes:
+
+- **Row = sender, column = receiver.** `matrix[A][B]` and `matrix[B][A]` are independent measurements of opposite directions, populated from the same `--bidir` exec but never duplicated.
+- **Diagonal cells (`matrix[X][X]`) are absent** — a node never tests against itself.
+- A complete result has exactly **`N × (N − 1)`** directed cells.
+- Sender-side (egress) figures are deliberately not exposed: on a healthy link they are bounded by the receiver and add noise without information.
 
 **`200 OK` — failed:**
 

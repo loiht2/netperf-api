@@ -45,26 +45,12 @@ const (
 	// pairTimeout caps a single iperf3 exec: test duration + generous overhead.
 	pairTimeout = 90 * time.Second
 
-	// defaultWorkerLabel is the node label selector used to exclude control-plane
-	// nodes from the measurement pool.  Override via the WORKER_NODE_LABEL env var.
-	defaultWorkerLabel = "node-role.kubernetes.io/worker=true"
-
 	// defaultServerPort is the iperf3 listener port (iperf3's own default).
 	// Override via IPERF3_PORT to avoid conflicts when another iperf3 instance
 	// already occupies 5201 on the same hosts (e.g. during e2e tests run alongside
 	// a production DaemonSet).
 	defaultServerPort = 5201
 )
-
-// workerNodeLabel returns the label selector used to filter worker nodes.
-// Read from the WORKER_NODE_LABEL environment variable so it can be changed
-// without recompiling (just update the Deployment env block in the YAML).
-func workerNodeLabel() string {
-	if l := os.Getenv("WORKER_NODE_LABEL"); l != "" {
-		return l
-	}
-	return defaultWorkerLabel
-}
 
 // iperf3ServerPort returns the TCP port the iperf3 server DaemonSet is
 // listening on. Reads IPERF3_PORT so integration tests can use an alternate
@@ -78,31 +64,51 @@ func iperf3ServerPort() int {
 	return defaultServerPort
 }
 
-// BandwidthEntry holds the measured bandwidth for a single directed link.
-// Error is non-empty when this specific pair failed; the consumer can detect
-// partial failures without the whole matrix being discarded.
-type BandwidthEntry struct {
-	MbpsIngress float64 `json:"mbps_ingress,omitempty"` // bandwidth received (remote → this node)
-	MbpsEgress  float64 `json:"mbps_egress,omitempty"`  // bandwidth sent (this node → remote)
-	Error       string  `json:"error,omitempty"`        // non-empty when this pair failed
+// NodeSnapshot is a point-in-time record of which nodes are ready for
+// measurement when a task is accepted. It is captured once per POST request
+// and passed to the background goroutine unchanged, so cluster churn during a
+// run (pods restarting, nodes draining) does not affect the in-flight task.
+// The next POST will capture a fresh snapshot with the updated cluster state.
+type NodeSnapshot struct {
+	IPs      []string          // ordered list of node HostIPs ready for testing
+	PodNames map[string]string // nodeIP → iperf3 DaemonSet pod name (for exec)
 }
 
-// pairResult captures all throughput figures from a single --bidir iperf3 exec.
-// One exec populates two matrix cells: [source][target] and [target][source].
+// BandwidthData is one cell of the directional matrix.
+//
+// Mbps is the bandwidth that the column node (Target) successfully received
+// from the row node (Source). Error is non-empty when this specific directed
+// link failed; in that case Mbps is 0.
+type BandwidthData struct {
+	Mbps  float64 `json:"mbps"`
+	Error string  `json:"error,omitempty"`
+}
+
+// pairResult captures the two directional throughputs produced by a single
+// --bidir iperf3 exec. From this one struct we populate exactly TWO matrix
+// cells: matrix[Source][Target] and matrix[Target][Source].
 type pairResult struct {
-	Source             string
-	Target             string
-	EgressMbps         float64 // sum_sent: source→target
-	IngressMbps        float64 // sum_received: target→source received at source
-	ReverseEgressMbps  float64 // sum_sent_bidir_reverse: target→source
-	ReverseIngressMbps float64 // sum_received_bidir_reverse: source→target received at target
-	Error              string
+	Source       string
+	Target       string
+	ToTargetMbps float64 // bandwidth Target received from Source — matrix[Source][Target].Mbps
+	ToSourceMbps float64 // bandwidth Source received from Target — matrix[Target][Source].Mbps
+	Error        string
 }
 
 // Result is the final payload stored in the task once the run completes.
+//
+// Matrix is a directional N×N adjacency matrix:
+//
+//	row    = sender (Source)
+//	column = receiver (Target)
+//	cell   = bandwidth that Target successfully received from Source (Mbps)
+//
+// Diagonal cells (matrix[X][X]) are absent — a node never tests against itself.
+// matrix[A][B] and matrix[B][A] are independent values populated from the
+// same --bidir exec but representing the two opposite directions of that link.
 type Result struct {
 	Nodes  []string                              `json:"nodes"`
-	Matrix map[string]map[string]*BandwidthEntry `json:"matrix"`
+	Matrix map[string]map[string]*BandwidthData `json:"matrix"`
 }
 
 // Executor holds the Kubernetes client and drives the full measurement lifecycle.
@@ -111,30 +117,105 @@ type Executor struct {
 	namespace string // K8s namespace where iperf3 DaemonSet pods live
 }
 
-// New constructs an Executor targeting the default "netperf" namespace.
+// New constructs an Executor targeting the default namespace.
 func New(c *k8sclient.Client) *Executor {
 	return &Executor{client: c, namespace: Namespace}
 }
 
 // NewForNamespace constructs an Executor targeting an arbitrary namespace.
 // Used by integration tests to operate inside an isolated temporary namespace
-// without touching the production "netperf" namespace.
+// without touching the production namespace.
 func NewForNamespace(c *k8sclient.Client, ns string) *Executor {
 	return &Executor{client: c, namespace: ns}
 }
 
-// CountReadyNodes returns the number of Ready worker nodes visible to the
-// executor. Used by the API handler to compute an ETA before the measurement
-// goroutine is launched.
-func (e *Executor) CountReadyNodes(ctx context.Context) (int, error) {
-	ips, _, err := e.readyNodeIPs(ctx)
-	return len(ips), err
+// DiscoverNodes performs a pod-based, data-plane-aware discovery of all nodes
+// that are ready to participate in a measurement. A node is included only when
+// its iperf3 DaemonSet pod satisfies BOTH conditions:
+//
+//   - Phase == Running  (the container process has started)
+//   - PodReady == True  (the readiness probe has passed — iperf3 is accepting connections)
+//
+// The node's HostIP (the real node IP, identical to the DaemonSet pod IP because
+// hostNetwork: true is set) is used as both the measurement target address and
+// the map key for pod lookup during exec.
+//
+// This approach is strictly superior to listing Nodes by label:
+//   - Eliminates races where a node is labelled but its pod has not started yet.
+//   - Catches pods that are Running but failing readiness (CrashLoop, bad config).
+//   - Requires no node-level RBAC permissions (pods/list is sufficient).
+func (e *Executor) DiscoverNodes(ctx context.Context) (*NodeSnapshot, error) {
+	pods, err := e.client.Clientset.CoreV1().Pods(e.namespace).List(ctx, metav1.ListOptions{
+		LabelSelector: PodLabelSelector,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("listing iperf3 DaemonSet pods: %w", err)
+	}
+
+	total := len(pods.Items)
+	log.Printf("[executor] discovery: %d pod(s) found with selector %q in namespace %q",
+		total, PodLabelSelector, e.namespace)
+
+	snapshot := &NodeSnapshot{
+		IPs:      []string{},
+		PodNames: make(map[string]string),
+	}
+
+	for i := range pods.Items {
+		pod := &pods.Items[i]
+		nodeName := pod.Spec.NodeName
+		if nodeName == "" {
+			nodeName = "<unscheduled>"
+		}
+
+		switch {
+		case pod.Status.Phase != corev1.PodRunning:
+			log.Printf("[executor] skip pod %s (node %s): phase=%s, want Running",
+				pod.Name, nodeName, pod.Status.Phase)
+
+		case !podIsReady(pod):
+			log.Printf("[executor] skip pod %s (node %s): PodReady condition is not True",
+				pod.Name, nodeName)
+
+		case pod.Status.HostIP == "":
+			log.Printf("[executor] skip pod %s (node %s): HostIP is empty",
+				pod.Name, nodeName)
+
+		default:
+			hostIP := pod.Status.HostIP
+			if _, dup := snapshot.PodNames[hostIP]; dup {
+				log.Printf("[executor] skip pod %s (node %s): HostIP %s already registered",
+					pod.Name, nodeName, hostIP)
+				continue
+			}
+			snapshot.IPs = append(snapshot.IPs, hostIP)
+			snapshot.PodNames[hostIP] = pod.Name
+		}
+	}
+
+	ready := len(snapshot.IPs)
+	log.Printf("[executor] discovery complete — total pods: %d | Running+Ready: %d | nodes: %v",
+		total, ready, snapshot.IPs)
+
+	return snapshot, nil
+}
+
+// podIsReady returns true when the pod's PodReady condition is True.
+func podIsReady(pod *corev1.Pod) bool {
+	for _, cond := range pod.Status.Conditions {
+		if cond.Type == corev1.PodReady {
+			return cond.Status == corev1.ConditionTrue
+		}
+	}
+	return false
 }
 
 // Run is the entry point called from a background goroutine.
+// It takes the NodeSnapshot captured at POST time so the measurement uses a
+// stable, consistent view of the cluster for its entire duration.
 // It updates the task in the store as it progresses and guarantees the
 // cancel func is removed from the store when it exits (deferred).
-func (e *Executor) Run(ctx context.Context, taskID string, s *store.Store) {
+func (e *Executor) Run(ctx context.Context, taskID string, s *store.Store, snapshot *NodeSnapshot) {
 	// Always remove the cancel func when we exit — whether we completed
 	// naturally, failed, or were cancelled externally via the DELETE endpoint.
 	defer s.DeleteCancel(taskID)
@@ -150,7 +231,7 @@ func (e *Executor) Run(ctx context.Context, taskID string, s *store.Store) {
 
 	setStatus(store.StatusRunning)
 
-	result, err := e.run(ctx)
+	result, err := e.run(ctx, snapshot)
 
 	t, _ := s.Get(taskID)
 	switch {
@@ -169,37 +250,32 @@ func (e *Executor) Run(ctx context.Context, taskID string, s *store.Store) {
 	s.Set(taskID, t)
 }
 
-// run performs the full measurement and returns the aggregated result.
-func (e *Executor) run(ctx context.Context) (*Result, error) {
-	// ── 1. Discover Ready nodes and their internal IPs ──────────────────────
-	nodeIPs, ipToName, err := e.readyNodeIPs(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("listing nodes: %w", err)
-	}
+// run performs the full measurement using the pre-captured node snapshot.
+// The snapshot is the single source of truth for node IPs and pod names for
+// the duration of this task; no further cluster API calls for node discovery
+// are made after this point.
+func (e *Executor) run(ctx context.Context, snapshot *NodeSnapshot) (*Result, error) {
+	nodeIPs := snapshot.IPs
 	if len(nodeIPs) < 2 {
-		return nil, fmt.Errorf("need at least 2 ready nodes, found %d", len(nodeIPs))
-	}
-	log.Printf("[executor] discovered %d ready nodes: %v", len(nodeIPs), nodeIPs)
-
-	// ── 2. Map each node IP → the iperf3 DaemonSet pod running on it ────────
-	nodePods, err := e.buildNodePodMap(ctx, ipToName)
-	if err != nil {
-		return nil, fmt.Errorf("mapping iperf3 pods to nodes: %w", err)
+		return nil, fmt.Errorf("need at least 2 ready nodes in snapshot, found %d", len(nodeIPs))
 	}
 
-	// ── 3. Generate the round-robin schedule ────────────────────────────────
+	log.Printf("[executor] starting measurement: %d nodes %v", len(nodeIPs), nodeIPs)
+
+	// ── Generate the round-robin schedule ────────────────────────────────────
 	sched := scheduler.GenerateSchedule(nodeIPs)
 	log.Printf("[executor] schedule: %d rounds for %d nodes", len(sched), len(nodeIPs))
 
-	// ── 4. Execute rounds with WaitGroup-based barrier synchronisation ───────
-	// Pre-initialise all row maps so concurrent readers never see a nil inner map.
-	matrix := make(map[string]map[string]*BandwidthEntry, len(nodeIPs))
+	// ── Allocate the directional matrix ──────────────────────────────────────
+	// One row per node, each row is an inner map keyed by Target. Diagonal
+	// cells are deliberately never inserted — a node never measures itself.
+	matrix := make(map[string]map[string]*BandwidthData, len(nodeIPs))
 	for _, ip := range nodeIPs {
-		matrix[ip] = make(map[string]*BandwidthEntry)
+		matrix[ip] = make(map[string]*BandwidthData, len(nodeIPs)-1)
 	}
 
 	for roundIdx, round := range sched {
-		log.Printf("[executor] round %d/%d — %d concurrent pairs", roundIdx+1, len(sched), len(round))
+		log.Printf("[executor] round %d/%d — %d concurrent pair(s)", roundIdx+1, len(sched), len(round))
 
 		// Pre-allocate a result slot per pair so goroutines write to distinct
 		// indices without needing a mutex on the slice itself.
@@ -213,36 +289,31 @@ func (e *Executor) run(ctx context.Context) (*Result, error) {
 				// Give each individual exec its own tight deadline.
 				pairCtx, cancel := context.WithTimeout(ctx, pairTimeout)
 				defer cancel()
-				roundResults[idx] = e.execPair(pairCtx, p, nodePods)
+				roundResults[idx] = e.execPair(pairCtx, p, snapshot.PodNames)
 			}(pairIdx, pair)
 		}
 
 		// Barrier: wait for ALL pairs in this round before proceeding.
 		wg.Wait()
 
-		// Merge into matrix (sequential after wg.Wait — no races).
-		// Each --bidir exec yields two directed entries from one measurement.
-		// Errors are ALWAYS written into the matrix so callers can see exactly
-		// which pair failed and why — never silently skipped.
+		// Each --bidir exec produces TWO directional matrix cells, one per
+		// direction. Errors propagate to BOTH cells (we cannot trust either
+		// direction when the exec itself failed) and are written explicitly so
+		// callers can pinpoint exactly which directed link is broken.
 		for _, pr := range roundResults {
-			log.Printf("[executor] pair %s→%s: egress=%.1f ingress=%.1f revEgress=%.1f revIngress=%.1f err=%q",
-				pr.Source, pr.Target,
-				pr.EgressMbps, pr.IngressMbps,
-				pr.ReverseEgressMbps, pr.ReverseIngressMbps,
-				pr.Error)
 			if pr.Error != "" {
-				matrix[pr.Source][pr.Target] = &BandwidthEntry{Error: pr.Error}
-				matrix[pr.Target][pr.Source] = &BandwidthEntry{Error: pr.Error}
+				log.Printf("[Round %d] Pair %s <-> %s FAILED: %s",
+					roundIdx+1, pr.Source, pr.Target, pr.Error)
+				matrix[pr.Source][pr.Target] = &BandwidthData{Error: pr.Error}
+				matrix[pr.Target][pr.Source] = &BandwidthData{Error: pr.Error}
 				continue
 			}
-			matrix[pr.Source][pr.Target] = &BandwidthEntry{
-				MbpsEgress:  pr.EgressMbps,
-				MbpsIngress: pr.IngressMbps,
-			}
-			matrix[pr.Target][pr.Source] = &BandwidthEntry{
-				MbpsEgress:  pr.ReverseEgressMbps,
-				MbpsIngress: pr.ReverseIngressMbps,
-			}
+			log.Printf("[Round %d] %s→%s = %.2f Mbps  |  %s→%s = %.2f Mbps",
+				roundIdx+1,
+				pr.Source, pr.Target, pr.ToTargetMbps,
+				pr.Target, pr.Source, pr.ToSourceMbps)
+			matrix[pr.Source][pr.Target] = &BandwidthData{Mbps: pr.ToTargetMbps}
+			matrix[pr.Target][pr.Source] = &BandwidthData{Mbps: pr.ToSourceMbps}
 		}
 
 		// Mandatory cooldown between rounds (skip after the final round).
@@ -266,17 +337,18 @@ func (e *Executor) run(ctx context.Context) (*Result, error) {
 }
 
 // execPair runs `iperf3 -c <Target> -t 10 --bidir -J` inside the source pod
-// and returns a pairResult containing throughput for both directed links.
+// and returns a pairResult containing the two receiver-side throughput values
+// — one for each direction of the link.
 //
 // Every failure path sets pr.Error so the caller can write a diagnostic entry
 // into the matrix — no error is ever silently swallowed or converted to zeros.
 //
-// Field mapping from iperf3 --bidir JSON (measured at the client/source pod):
+// Field mapping from iperf3 --bidir JSON:
 //
-//	end.sum_sent                   → EgressMbps         (source→target sender)
-//	end.sum_received               → IngressMbps        (source←target receiver)
-//	end.sum_sent_bidir_reverse     → ReverseEgressMbps  (target→source sender)
-//	end.sum_received_bidir_reverse → ReverseIngressMbps (target←source receiver)
+//	end.sum_received               → ToTargetMbps  (target's receiver-side count
+//	                                                 of the source→target stream)
+//	end.sum_received_bidir_reverse → ToSourceMbps  (source's receiver-side count
+//	                                                 of the target→source stream)
 func (e *Executor) execPair(ctx context.Context, p scheduler.Pair, nodePods map[string]string) pairResult {
 	pr := pairResult{Source: p.Source, Target: p.Target}
 
@@ -297,11 +369,10 @@ func (e *Executor) execPair(ctx context.Context, p scheduler.Pair, nodePods map[
 	}
 
 	stdout, stderr, execErr := e.podExec(ctx, srcPod, cmd)
+	// Concise envelope log — sizes only, never raw payload, to keep log
+	// volume bounded. Raw stdout is only emitted on parse failure below.
 	log.Printf("[executor] pair %s→%s: stdout=%d bytes stderr=%d bytes err=%v",
 		p.Source, p.Target, len(stdout), len(stderr), execErr)
-	// Log the raw stdout unconditionally so pod logs always show what iperf3
-	// actually returned — crucial for diagnosing JSON mapping failures.
-	log.Printf("[executor] pair %s→%s: raw stdout:\n%s", p.Source, p.Target, stdout)
 
 	// No stdout at all — surface whatever exec-level error we have.
 	if len(stdout) == 0 {
@@ -318,13 +389,16 @@ func (e *Executor) execPair(ctx context.Context, p scheduler.Pair, nodePods map[
 	// strips any warning lines that precede the opening '{'.
 	out, parseErr := iperf3.Parse([]byte(stdout))
 	if parseErr != nil {
-		// JSON parse failed — include as much diagnostic context as possible.
+		// Parsing failed: dump the raw stdout to logs (this is the only path
+		// that emits raw iperf3 output, kept for debugging unexpected formats).
+		// Truncated to 4 KB to stay safe on log forwarders.
+		log.Printf("[executor] pair %s→%s: PARSE ERROR — raw stdout (truncated to 4KB):\n%.4096s",
+			p.Source, p.Target, stdout)
 		if execErr != nil {
 			pr.Error = fmt.Sprintf("JSON parse failed: %v | exec error: %v | stderr: %s",
 				parseErr, execErr, stderr)
 		} else {
-			pr.Error = fmt.Sprintf("JSON parse failed: %v | raw stdout: %.300s",
-				parseErr, stdout)
+			pr.Error = fmt.Sprintf("JSON parse failed: %v", parseErr)
 		}
 		return pr
 	}
@@ -342,10 +416,8 @@ func (e *Executor) execPair(ctx context.Context, p scheduler.Pair, nodePods map[
 		return pr
 	}
 
-	pr.EgressMbps         = iperf3.BitsToMbps(bidir.FwdSentBps)
-	pr.IngressMbps        = iperf3.BitsToMbps(bidir.FwdRecvBps)
-	pr.ReverseEgressMbps  = iperf3.BitsToMbps(bidir.RevSentBps)
-	pr.ReverseIngressMbps = iperf3.BitsToMbps(bidir.RevRecvBps)
+	pr.ToTargetMbps = iperf3.BitsToMbps(bidir.ToTargetBps)
+	pr.ToSourceMbps = iperf3.BitsToMbps(bidir.ToSourceBps)
 	return pr
 }
 
@@ -392,85 +464,4 @@ func (e *Executor) podExec(ctx context.Context, podName string, cmd []string) (s
 		return stdout.String(), stderr.String(), err
 	}
 	return stdout.String(), stderr.String(), nil
-}
-
-// ── Node / Pod discovery helpers ─────────────────────────────────────────────
-
-// readyNodeIPs returns the InternalIP of every Ready worker node, plus a
-// reverse map (IP → node name) used to locate DaemonSet pods below.
-// Control-plane nodes are excluded via the WORKER_NODE_LABEL selector so
-// we only measure bandwidth across the data-plane node pool.
-func (e *Executor) readyNodeIPs(ctx context.Context) (ips []string, ipToName map[string]string, err error) {
-	label := workerNodeLabel()
-	log.Printf("[executor] listing nodes with label selector: %q", label)
-	nodes, err := e.client.Clientset.CoreV1().Nodes().List(ctx, metav1.ListOptions{
-		LabelSelector: label,
-	})
-	if err != nil {
-		return nil, nil, err
-	}
-
-	ipToName = make(map[string]string)
-	for i := range nodes.Items {
-		n := &nodes.Items[i]
-		if !nodeIsReady(n) {
-			continue
-		}
-		ip := nodeInternalIP(n)
-		if ip == "" {
-			log.Printf("[executor] node %s has no InternalIP, skipping", n.Name)
-			continue
-		}
-		ips = append(ips, ip)
-		ipToName[ip] = n.Name
-	}
-	return ips, ipToName, nil
-}
-
-func nodeIsReady(n *corev1.Node) bool {
-	for _, c := range n.Status.Conditions {
-		if c.Type == corev1.NodeReady && c.Status == corev1.ConditionTrue {
-			return true
-		}
-	}
-	return false
-}
-
-func nodeInternalIP(n *corev1.Node) string {
-	for _, addr := range n.Status.Addresses {
-		if addr.Type == corev1.NodeInternalIP {
-			return addr.Address
-		}
-	}
-	return ""
-}
-
-// buildNodePodMap returns a map from nodeIP → iperf3 DaemonSet pod name.
-// Only Running pods are included; a missing entry means that node is skipped.
-func (e *Executor) buildNodePodMap(ctx context.Context, ipToName map[string]string) (map[string]string, error) {
-	pods, err := e.client.Clientset.CoreV1().Pods(e.namespace).List(ctx, metav1.ListOptions{
-		LabelSelector: PodLabelSelector,
-	})
-	if err != nil {
-		return nil, err
-	}
-
-	// Invert ipToName so we can look up by node name.
-	nameToIP := make(map[string]string, len(ipToName))
-	for ip, name := range ipToName {
-		nameToIP[name] = ip
-	}
-
-	result := make(map[string]string)
-	for i := range pods.Items {
-		pod := &pods.Items[i]
-		if pod.Status.Phase != corev1.PodRunning {
-			log.Printf("[executor] pod %s on node %s is %s, skipping", pod.Name, pod.Spec.NodeName, pod.Status.Phase)
-			continue
-		}
-		if ip, ok := nameToIP[pod.Spec.NodeName]; ok {
-			result[ip] = pod.Name
-		}
-	}
-	return result, nil
 }

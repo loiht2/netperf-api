@@ -21,10 +21,14 @@ package integration_test
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strconv"
+	"sync"
 	"testing"
 	"time"
 
@@ -36,6 +40,7 @@ import (
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
 
+	"github.com/netperf/netperf-api/internal/api"
 	"github.com/netperf/netperf-api/internal/executor"
 	"github.com/netperf/netperf-api/internal/k8sclient"
 	"github.com/netperf/netperf-api/internal/store"
@@ -319,7 +324,6 @@ func TestE2E_FullMeasurementCycle(t *testing.T) {
 	// iperf3-server DaemonSet that may already be listening on the default 5201.
 	// IPERF3_PORT is read by executor.iperf3ServerPort() and restored by t.Setenv.
 	const testPort = 5202
-	t.Setenv("WORKER_NODE_LABEL", nodeLabel)
 	t.Setenv("IPERF3_PORT", strconv.Itoa(testPort))
 
 	client, cs := buildClient(t)
@@ -346,6 +350,19 @@ func TestE2E_FullMeasurementCycle(t *testing.T) {
 	// ── Execute measurement ──────────────────────────────────────────────────
 	exec := executor.NewForNamespace(client, ns)
 
+	// Discover nodes via the pod-based snapshot before starting the task.
+	// This mirrors what the real POST handler does before launching the goroutine.
+	discoverCtx, discoverCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer discoverCancel()
+	snapshot, err := exec.DiscoverNodes(discoverCtx)
+	if err != nil {
+		t.Fatalf("DiscoverNodes failed: %v", err)
+	}
+	t.Logf("snapshot: %d nodes ready — %v", len(snapshot.IPs), snapshot.IPs)
+	if len(snapshot.IPs) < 2 {
+		t.Skipf("discovery returned only %d node(s); need at least 2", len(snapshot.IPs))
+	}
+
 	s := store.New()
 	taskID := "e2e-task-001"
 	s.Set(taskID, &store.Task{
@@ -360,7 +377,7 @@ func TestE2E_FullMeasurementCycle(t *testing.T) {
 	defer runCancel()
 
 	t.Log("starting measurement …")
-	exec.Run(runCtx, taskID, s)
+	exec.Run(runCtx, taskID, s, snapshot)
 
 	// ── Assertions ───────────────────────────────────────────────────────────
 	task, ok := s.Get(taskID)
@@ -381,33 +398,40 @@ func TestE2E_FullMeasurementCycle(t *testing.T) {
 	t.Logf("measurement finished in %s", task.Duration)
 	t.Logf("nodes tested: %v", result.Nodes)
 
-	// 2. Matrix must cover all N*(N-1) directed pairs.
-	// Each --bidir run populates both [src][tgt] and [tgt][src], so the full
-	// matrix has N*(N-1) entries (NxN grid minus the diagonal).
-	expectedEntries := nNodes * (nNodes - 1)
-	totalEntries := 0
-	for _, targets := range result.Matrix {
-		totalEntries += len(targets)
+	// 2. Matrix invariants for a True Directional N×N matrix:
+	//    - Exactly N rows (one per source).
+	//    - Each row has N-1 columns (the diagonal is intentionally absent).
+	//    - Total directional entries = N*(N-1) — every ordered pair appears once.
+	if got := len(result.Matrix); got != nNodes {
+		t.Errorf("want %d matrix rows, got %d", nNodes, got)
 	}
-	if totalEntries != expectedEntries {
-		t.Errorf("want %d matrix entries (N*(N-1) for %d nodes), got %d",
-			expectedEntries, nNodes, totalEntries)
+	totalCells := 0
+	for src, row := range result.Matrix {
+		if _, hasDiag := row[src]; hasDiag {
+			t.Errorf("diagonal cell matrix[%s][%s] must NOT be present", src, src)
+		}
+		if len(row) != nNodes-1 {
+			t.Errorf("row matrix[%s]: want %d cells, got %d", src, nNodes-1, len(row))
+		}
+		totalCells += len(row)
+	}
+	if want := nNodes * (nNodes - 1); totalCells != want {
+		t.Errorf("want %d directional cells (N*(N-1) for %d nodes), got %d",
+			want, nNodes, totalCells)
 	}
 
-	// 3. Per-entry assertions.
-	for src, targets := range result.Matrix {
-		for tgt, entry := range targets {
-			t.Logf("  %s → %s : egress=%.1f Mbps ingress=%.1f Mbps",
-				src, tgt, entry.MbpsEgress, entry.MbpsIngress)
-
-			// Bandwidth must be positive — zero means iperf3 didn't produce output.
-			if entry.MbpsEgress <= 0 {
-				t.Errorf("matrix[%s][%s]: mbps_egress must be > 0, got %f",
-					src, tgt, entry.MbpsEgress)
+	// 3. Per-cell assertions: every directed link must be > 0 Mbps and free of
+	// errors, and matrix[A][B] / matrix[B][A] must be independent values
+	// (NOT silently duplicated, which was the redundancy in the old design).
+	for src, row := range result.Matrix {
+		for tgt, cell := range row {
+			t.Logf("  %s → %s : %.2f Mbps", src, tgt, cell.Mbps)
+			if cell.Error != "" {
+				t.Errorf("matrix[%s][%s]: unexpected error: %s", src, tgt, cell.Error)
+				continue
 			}
-			if entry.MbpsIngress <= 0 {
-				t.Errorf("matrix[%s][%s]: mbps_ingress must be > 0, got %f",
-					src, tgt, entry.MbpsIngress)
+			if cell.Mbps <= 0 {
+				t.Errorf("matrix[%s][%s].mbps must be > 0, got %f", src, tgt, cell.Mbps)
 			}
 		}
 	}
@@ -418,7 +442,6 @@ func TestE2E_FullMeasurementCycle(t *testing.T) {
 func TestE2E_CancelMidFlight(t *testing.T) {
 	const nodeLabel = "kubernetes.io/os=linux"
 	const testPort = 5202
-	t.Setenv("WORKER_NODE_LABEL", nodeLabel)
 	t.Setenv("IPERF3_PORT", strconv.Itoa(testPort))
 
 	client, cs := buildClient(t)
@@ -437,6 +460,17 @@ func TestE2E_CancelMidFlight(t *testing.T) {
 
 	exec := executor.NewForNamespace(client, ns)
 
+	// Capture the node snapshot before launching the goroutine, mirroring the
+	// real POST handler flow. Use the cancellable context so discovery is also
+	// aborted if the test itself is cancelled.
+	discoverCtx, discoverCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer discoverCancel()
+	snapshot, err := exec.DiscoverNodes(discoverCtx)
+	if err != nil {
+		t.Fatalf("DiscoverNodes failed: %v", err)
+	}
+	t.Logf("snapshot: %d nodes — %v", len(snapshot.IPs), snapshot.IPs)
+
 	s := store.New()
 	taskID := "cancel-test-task"
 	s.Set(taskID, &store.Task{
@@ -453,7 +487,7 @@ func TestE2E_CancelMidFlight(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		exec.Run(ctx, taskID, s)
+		exec.Run(ctx, taskID, s, snapshot)
 	}()
 
 	// Give the first exec a moment to start, then cancel.
@@ -474,4 +508,135 @@ func TestE2E_CancelMidFlight(t *testing.T) {
 		t.Errorf("want status=canceled, got %q (error: %s)", task.Status, task.Error)
 	}
 	t.Logf("cancel test passed — task status: %s", task.Status)
+}
+
+// TestE2E_GlobalLock409Conflict fires two concurrent POST requests against a
+// real httptest-wrapped HTTP server backed by a real Executor, and asserts
+// that EXACTLY ONE wins (202 Accepted) while the other gets the lock-conflict
+// response (409 Conflict). This validates the global mutex end-to-end:
+//
+//   - Concurrency: two goroutines hit POST simultaneously
+//   - Statelessness of failed POST: the rejected request leaves no orphan task
+//   - Cleanup: the accepted task is cancelled via DELETE so the test exits in
+//     ~5–10 s rather than waiting ~45 s for the natural completion
+func TestE2E_GlobalLock409Conflict(t *testing.T) {
+	const nodeLabel = "kubernetes.io/os=linux"
+	const testPort = 5202
+	t.Setenv("IPERF3_PORT", strconv.Itoa(testPort))
+
+	client, cs := buildClient(t)
+
+	cfg, _ := clientcmd.BuildConfigFromFlags("", kubeConfigPath())
+	if countWorkerNodes(t, cfg, nodeLabel) < 2 {
+		t.Skip("need at least 2 Ready nodes")
+	}
+
+	ns := createIsolatedNamespace(t, cs)
+	deployIperf3DaemonSet(t, cs, ns, testPort)
+
+	waitCtx, waitCancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer waitCancel()
+	waitForDaemonSetReady(t, waitCtx, cs, ns)
+
+	// ── Real HTTP server ─────────────────────────────────────────────────────
+	exec := executor.NewForNamespace(client, ns)
+	st := store.New()
+	h := api.New(st, exec)
+	mux := http.NewServeMux()
+	h.RegisterRoutes(mux)
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	// ── Fire two concurrent POSTs ────────────────────────────────────────────
+	type result struct {
+		status int
+		body   map[string]interface{}
+	}
+	results := make([]result, 2)
+	var wg sync.WaitGroup
+	wg.Add(2)
+	postURL := srv.URL + "/api/v1/network-measure"
+
+	for i := 0; i < 2; i++ {
+		i := i
+		go func() {
+			defer wg.Done()
+			resp, err := http.Post(postURL, "application/json", nil)
+			if err != nil {
+				t.Errorf("POST #%d: %v", i, err)
+				return
+			}
+			defer resp.Body.Close()
+			var body map[string]interface{}
+			_ = json.NewDecoder(resp.Body).Decode(&body)
+			results[i] = result{status: resp.StatusCode, body: body}
+			t.Logf("POST #%d → status=%d body=%v", i, resp.StatusCode, body)
+		}()
+	}
+	wg.Wait()
+
+	// ── Assert exactly one 202 and one 409 ───────────────────────────────────
+	var accepted, conflicted *result
+	for i := range results {
+		switch results[i].status {
+		case http.StatusAccepted:
+			if accepted != nil {
+				t.Fatal("both POSTs got 202 — global lock failed to serialise")
+			}
+			accepted = &results[i]
+		case http.StatusConflict:
+			if conflicted != nil {
+				t.Fatal("both POSTs got 409 — neither acquired the lock")
+			}
+			conflicted = &results[i]
+		default:
+			t.Fatalf("unexpected status %d (body=%v)", results[i].status, results[i].body)
+		}
+	}
+	if accepted == nil || conflicted == nil {
+		t.Fatalf("want one 202 and one 409, got: %+v", results)
+	}
+
+	// 409 body must contain the conflict marker.
+	if status, _ := conflicted.body["status"].(string); status != "conflict" {
+		t.Errorf(`409 body: want status="conflict", got %v`, conflicted.body["status"])
+	}
+
+	// 202 body must include the enriched fields.
+	taskID, _ := accepted.body["task_id"].(string)
+	if taskID == "" {
+		t.Fatalf("202 body missing task_id: %v", accepted.body)
+	}
+	for _, key := range []string{"node_count", "nodes", "total_rounds", "estimated_duration_seconds"} {
+		if _, ok := accepted.body[key]; !ok {
+			t.Errorf("202 body missing %q: %v", key, accepted.body)
+		}
+	}
+
+	// ── Clean up: DELETE the running task so this test does not block 45 s ───
+	delReq, _ := http.NewRequest(http.MethodDelete,
+		srv.URL+"/api/v1/network-measure/"+taskID, nil)
+	delResp, err := http.DefaultClient.Do(delReq)
+	if err != nil {
+		t.Fatalf("DELETE: %v", err)
+	}
+	delResp.Body.Close()
+	if delResp.StatusCode != http.StatusAccepted {
+		t.Errorf("DELETE: want 202, got %d", delResp.StatusCode)
+	}
+
+	// Wait for the task to actually transition to canceled / failed before
+	// returning so the namespace cleanup hook does not race the goroutine.
+	deadline := time.Now().Add(2 * time.Minute)
+	for time.Now().Before(deadline) {
+		task, ok := st.Get(taskID)
+		if ok && (task.Status == store.StatusCanceled ||
+			task.Status == store.StatusCompleted ||
+			task.Status == store.StatusFailed) {
+			t.Logf("final task status: %s", task.Status)
+			return
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	t.Fatal("task did not reach a terminal state within 2 minutes after DELETE")
 }

@@ -190,12 +190,10 @@ if err := json.Unmarshal(raw, &obj); err == nil {
 
 ### Additional hardening applied at the same time
 
-- **Never `continue` silently on parse error.** Every failure path in `execPair` writes a diagnostic `BandwidthEntry{Error: "..."}` into the matrix so callers can see exactly which pair failed and why.
-- **Log raw stdout unconditionally** before parsing. Even when parsing succeeds, the full iperf3 JSON appears in pod logs, which is invaluable when diagnosing field-mapping problems:
-  ```go
-  log.Printf("[executor] pair %s→%s: raw stdout:\n%s", p.Source, p.Target, stdout)
-  ```
+- **Never `continue` silently on parse error.** Every failure path in `execPair` writes a diagnostic `BandwidthData{Error: "..."}` into BOTH directional matrix cells for the affected pair so callers can see exactly which directed link is broken.
 - **`json.RawMessage` for the top-level `end` field.** `Output.End` is kept as `json.RawMessage` and decoded lazily by `ParseEnd`. This makes the parser tolerant of missing or differently-typed fields across iperf3 versions, and prevents a missing `sum_sent_bidir_reverse` from zeroing the whole measurement.
+
+> **Note:** an earlier iteration logged raw iperf3 stdout unconditionally for every pair — see Bug 6 below for why that was reverted.
 
 ---
 
@@ -230,3 +228,87 @@ case <-ctx.Done():
 ```
 
 Using a plain `time.Sleep` here broke the `TestE2E_CancelMidFlight` test — sleep is not interruptible by context cancellation, so all rounds completed even after the context was cancelled, and the task ended with `status: completed` instead of `status: canceled`.
+
+---
+
+## Bug 5: Missing Nodes — `client-go` node listing returned 3 of 6
+
+### Symptom
+
+A 6-node cluster consistently produced a measurement matrix containing only 3 nodes, even though all six nodes carried the configured `WORKER_NODE_LABEL` and were `Ready`. The omitted nodes had healthy iperf3 DaemonSet pods running on them.
+
+### Root cause
+
+The original discovery path was **node-centric**: list `Nodes` by label, filter for `NodeReady == True`, then look up the matching iperf3 pod by `Spec.NodeName`. Two problems compounded:
+
+1. **`client-go` node-list races** — between the moment the executor listed nodes and the moment it listed pods, kubelet status updates could land on the API server, but the executor was operating on a stale node-list snapshot. A node that had just transitioned in/out of `Ready` could be filtered out spuriously.
+2. **Label drift** — operators sometimes labelled new nodes asynchronously (Cluster API, Karpenter, etc.). The DaemonSet's `tolerations: Exists` made the iperf3 pod schedule everywhere immediately, but the `WORKER_NODE_LABEL` selector excluded those not-yet-labelled nodes — even though their pods were `Running` and `Ready`.
+
+In practice these two effects combined to mask up to half the cluster.
+
+### Fix
+
+Switch to **pod-based, data-plane-aware discovery**. The new `executor.DiscoverNodes` ignores Node objects entirely and instead lists pods that satisfy:
+
+```
+Label:           app=iperf3-server   (the DaemonSet selector)
+Phase:           Running
+PodReady:        True
+HostIP:          non-empty
+```
+
+The pod's `Status.HostIP` (the node's real IP under `hostNetwork: true`) is used as both the measurement target address and the map key for `pods/exec`. Pod-based discovery is strictly superior because:
+
+- It asks the data plane "which iperf3 servers are actually accepting connections right now?" — the only question that matters for a measurement.
+- It eliminates label-drift bugs (a not-yet-labelled node still has its DaemonSet pod and is therefore included).
+- It eliminates the node-list / pod-list race entirely (one API call, one set of objects).
+- It requires no `nodes` RBAC permission — `pods/list` is sufficient.
+
+Per-pod skip reasons are logged so an operator can immediately see *why* a node is excluded (`phase=Pending`, `PodReady is not True`, `HostIP is empty`, etc.).
+
+---
+
+## Bug 6: Log Pollution — raw iperf3 JSON in every executor log line
+
+### Symptom
+
+After deploying the parser fix from Bug 3, the executor logged the full raw iperf3 `-J` output (~12–15 KB of JSON) for every pair, every round, every measurement. On a 6-node cluster that's 5 rounds × 3 pairs × ~15 KB ≈ **225 KB of JSON per measurement**, repeated whenever a measurement runs. Symptoms downstream included:
+
+- **Fluentd / Vector forwarders OOM-ing** on bursts of multi-line log records.
+- **Log-search UIs hanging** when an operator opened a single pod's log tab.
+- **Cloud-logging bills increasing** by an order of magnitude on busy clusters.
+- **Terminal output unusable** when running tests locally — pasted JSON dwarfed every other line.
+
+### Root cause
+
+While debugging Bug 3 we deliberately added an unconditional raw-stdout dump so we could correlate parsed values against real iperf3 output:
+
+```go
+// REMOVED — was logging the full JSON document on the success path too
+log.Printf("[executor] pair %s→%s: raw stdout:\n%s", p.Source, p.Target, stdout)
+```
+
+Once parsing was provably correct on the success path, this line was no longer load-bearing — but it remained in place by inertia, dumping the full document on every successful exec.
+
+### Fix
+
+**Only log raw stdout when parsing actually fails.** On the success path, emit a single structured one-liner per pair:
+
+```go
+log.Printf("[Round %d] Pair %s <-> %s completed. Ingress: %.2f Mbps, ReverseIngress: %.2f Mbps",
+    roundIdx+1, pr.Source, pr.Target, pr.IngressMbps, pr.ReverseIngressMbps)
+```
+
+On the failure path, dump the raw stdout truncated to **4 KB** (enough to identify the problem, bounded against runaway output):
+
+```go
+if parseErr != nil {
+    log.Printf("[executor] pair %s→%s: PARSE ERROR — raw stdout (truncated to 4KB):\n%.4096s",
+        p.Source, p.Target, stdout)
+    ...
+}
+```
+
+The byte-size envelope log (`stdout=N bytes stderr=M bytes err=...`) is preserved on every pair — it confirms the exec ran and gives a baseline for diagnosing silent failures, without dumping any payload.
+
+**Result:** on a healthy run the executor now produces one structured line per pair (~120 bytes) instead of ~15 KB. Logs are searchable, forwarders are happy, and parse errors still surface the raw payload exactly when an operator needs it.

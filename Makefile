@@ -41,7 +41,7 @@ docker-push: docker-build
 
 ## test-unit: Run pure unit tests (no cluster required, includes -race)
 test-unit:
-	$(GOTEST) ./internal/scheduler/... ./pkg/iperf3/...
+	$(GOTEST) ./internal/scheduler/... ./internal/executor/... ./pkg/iperf3/...
 
 ## test-e2e: Run live Kubernetes integration tests (requires a reachable cluster)
 ##           Prerequisites: KUBECONFIG set, cluster-admin or equivalent RBAC.

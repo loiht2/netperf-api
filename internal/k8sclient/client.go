@@ -15,8 +15,13 @@ import (
 
 // Client bundles the typed Kubernetes clientset and the raw REST config.
 // The REST config is needed separately by remotecommand.NewSPDYExecutor.
+//
+// Clientset is typed as kubernetes.Interface (not the concrete *Clientset) so
+// unit tests can substitute fake.NewSimpleClientset() without touching the
+// REST config. Production code only uses the typed accessors that the
+// interface exposes (CoreV1, AppsV1, …).
 type Client struct {
-	Clientset  *kubernetes.Clientset
+	Clientset  kubernetes.Interface
 	RestConfig *rest.Config
 }
 

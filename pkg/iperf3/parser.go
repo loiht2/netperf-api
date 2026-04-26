@@ -7,8 +7,12 @@
 //
 // The End section is retained as json.RawMessage and decoded lazily by ParseEnd
 // via a map[string]json.RawMessage. This makes the parser tolerant of missing or
-// differently-typed fields across iperf3 versions and prevents a missing
-// "sum_sent_bidir_reverse" from silently zeroing the entire measurement.
+// differently-typed fields across iperf3 versions, so for example a missing
+// "sum_received_bidir_reverse" silently yields 0 for the reverse-direction
+// receiver instead of failing the whole document.
+//
+// Only the two receiver-side counters (sum_received and sum_received_bidir_reverse)
+// are parsed; the sender-side counters are not used by this project.
 package iperf3
 
 import (
@@ -25,19 +29,26 @@ type Output struct {
 	End json.RawMessage `json:"end"`
 }
 
-// BidirResult holds all four directed throughput values from one --bidir exec.
+// BidirResult holds the two receiver-side throughput values from one --bidir
+// iperf3 exec — exactly the data needed to populate a directional N×N matrix
+// where matrix[Source][Target] = bandwidth Target received from Source.
 //
-// Field mapping (measured at the client / source pod):
+// Sender-side counters (sum_sent / sum_sent_bidir_reverse) are intentionally
+// not parsed: on a healthy link they are bounded by the receiver and add no
+// information for our use case.
 //
-//	FwdSentBps  ← end.sum_sent                   (source→target sender)
-//	FwdRecvBps  ← end.sum_received                (source←target receiver)
-//	RevSentBps  ← end.sum_sent_bidir_reverse       (target→source sender)
-//	RevRecvBps  ← end.sum_received_bidir_reverse   (target←source receiver)
+// iperf3 -J --bidir field mapping (forward = the stream that the client
+// initiated with -c, reverse = the second stream added by --bidir):
+//
+//	ToTargetBps ← end.sum_received               receiver-side counter for the
+//	                                             FORWARD stream (source → target)
+//	                                             = bandwidth target received from source
+//	ToSourceBps ← end.sum_received_bidir_reverse receiver-side counter for the
+//	                                             REVERSE stream (target → source)
+//	                                             = bandwidth source received from target
 type BidirResult struct {
-	FwdSentBps float64
-	FwdRecvBps float64
-	RevSentBps float64
-	RevRecvBps float64
+	ToTargetBps float64
+	ToSourceBps float64
 }
 
 // extractJSON returns the slice of data from the first '{' to the last '}',
@@ -82,10 +93,8 @@ func ParseEnd(endRaw json.RawMessage) (BidirResult, error) {
 		return BidirResult{}, fmt.Errorf("parsing end section: %w", err)
 	}
 	return BidirResult{
-		FwdSentBps: bpsFromSumField(endMap, "sum_sent"),
-		FwdRecvBps: bpsFromSumField(endMap, "sum_received"),
-		RevSentBps: bpsFromSumField(endMap, "sum_sent_bidir_reverse"),
-		RevRecvBps: bpsFromSumField(endMap, "sum_received_bidir_reverse"),
+		ToTargetBps: bpsFromSumField(endMap, "sum_received"),
+		ToSourceBps: bpsFromSumField(endMap, "sum_received_bidir_reverse"),
 	}, nil
 }
 

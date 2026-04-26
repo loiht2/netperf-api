@@ -50,12 +50,11 @@ func (h *Handler) healthz(w http.ResponseWriter, _ *http.Request) {
 //
 // Flow:
 //  1. Acquire the global lock; reject with 409 if a measurement is already running.
-//  2. Count ready worker nodes for an ETA estimate.
-//  3. Generate a UUID task_id and record the task as "pending".
-//  4. Create a cancellable context and store its CancelFunc under the task_id
-//     so the DELETE handler can abort it later.
-//  5. Launch the executor in a background goroutine that releases the lock on exit.
-//  6. Return 202 Accepted with task_id and estimated_duration_seconds.
+//  2. Discover ready nodes (pod-based snapshot) — determines the ETA and the
+//     exact node set that will be tested. Releases the lock and returns 503 on error.
+//  3. Register the task as "pending" and store its CancelFunc.
+//  4. Launch the executor in a background goroutine that releases the lock on exit.
+//  5. Return 202 Accepted with the enriched response including nodes and ETA.
 func (h *Handler) startMeasure(w http.ResponseWriter, r *http.Request) {
 	// ── Global execution lock ────────────────────────────────────────────────
 	h.mu.Lock()
@@ -70,14 +69,26 @@ func (h *Handler) startMeasure(w http.ResponseWriter, r *http.Request) {
 	h.isRunning = true
 	h.mu.Unlock()
 
-	// ── ETA estimate ─────────────────────────────────────────────────────────
-	// Count nodes now (fast list call) so we can tell the caller how long to wait.
-	// On error nNodes = 0 → estimatedSeconds = 0 (safe: executor will report the
-	// real failure once it runs).
-	nodeCtx, nodeCancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer nodeCancel()
-	nNodes, _ := h.executor.CountReadyNodes(nodeCtx)
+	// ── Pod-based node discovery (snapshot) ──────────────────────────────────
+	// Discover now so the 202 response can report exactly which nodes will be
+	// tested. The snapshot is passed directly to the background goroutine —
+	// cluster changes after this point do not affect the current task.
+	discoverCtx, discoverCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer discoverCancel()
+	snapshot, err := h.executor.DiscoverNodes(discoverCtx)
+	if err != nil {
+		h.mu.Lock()
+		h.isRunning = false
+		h.mu.Unlock()
+		writeJSON(w, http.StatusServiceUnavailable, map[string]interface{}{
+			"error":  "node discovery failed: " + err.Error(),
+			"status": "unavailable",
+		})
+		return
+	}
 
+	// ── ETA calculation ───────────────────────────────────────────────────────
+	nNodes := len(snapshot.IPs)
 	var rounds int
 	if nNodes > 0 {
 		if nNodes%2 == 0 {
@@ -86,7 +97,7 @@ func (h *Handler) startMeasure(w http.ResponseWriter, r *http.Request) {
 			rounds = nNodes
 		}
 	}
-	estimatedSeconds := rounds * (executor.IperfDuration + 5) // 10s test + 5s cooldown
+	estimatedSeconds := rounds * (executor.IperfDuration + 5) // 10 s test + 5 s cooldown
 
 	// ── Task registration ─────────────────────────────────────────────────────
 	taskID := uuid.New().String()
@@ -109,14 +120,17 @@ func (h *Handler) startMeasure(w http.ResponseWriter, r *http.Request) {
 			h.isRunning = false
 			h.mu.Unlock()
 		}()
-		h.executor.Run(ctx, taskID, h.store)
+		h.executor.Run(ctx, taskID, h.store, snapshot)
 	}()
 
 	writeJSON(w, http.StatusAccepted, map[string]interface{}{
 		"task_id":                    taskID,
 		"status":                     "accepted",
+		"message":                    "Measurement started.",
+		"node_count":                 nNodes,
+		"nodes":                      snapshot.IPs,
+		"total_rounds":               rounds,
 		"estimated_duration_seconds": estimatedSeconds,
-		"message":                    "Measurement started. Please poll the GET endpoint.",
 	})
 }
 
