@@ -60,8 +60,8 @@ sequenceDiagram
 | **SPDY remotecommand** | Same multiplexed framing used by `kubectl exec`; carries stdout/stderr over a single TCP connection |
 | **Circle-method scheduling** | Each node appears in at most one active pair per round — maximises parallelism without creating bandwidth bottlenecks |
 | **Exec probes (not TCP socket probes)** | TCP socket probes half-open to port 5201 and immediately close, causing iperf3 `Bad file descriptor` errors in server logs |
-| **`emptyDir` on `/tmp`** | iperf3 `--bidir` creates temporary stream state files under `/tmp`. A read-only root filesystem requires an explicit writable volume mount there |
-| **Fast-Retry per pair (1×10 s + 3×5 s)** | Tailscale reconnect events sever the API-server ↔ Kubelet SPDY leg gracefully (TCP FIN → EOF, not error). iperf3 `-J` buffers all output, so a mid-test stream close yields 0 bytes with `err=nil`. The retry loop detects this and re-runs the pair on the recovered link |
+| **`emptyDir` on `/tmp` (hard requirement)** | iperf3 `--bidir` and the Store-and-Fetch pattern both write temporary files to `/tmp`. A read-only root filesystem (`readOnlyRootFilesystem: true`) requires an explicit writable volume mount there — see [Prerequisites](#prerequisites) |
+| **Store-and-Fetch execution** | iperf3 is run with `> /tmp/<file>.json` redirect (Step A); output is retrieved with a separate `cat` exec (Step B); file is removed with `rm -f` (Step C). This decouples measurement from SPDY stream liveness: Tailscale reconnects that sever the exec stream mid-test no longer lose results, because iperf3 continues writing to the file inside the container |
 
 ---
 
@@ -73,6 +73,8 @@ sequenceDiagram
 | Docker | any recent version |
 | `kubectl` | matching cluster version |
 | Kubernetes | 1.24+ |
+
+> **Hard requirement — `emptyDir` on `/tmp`:** The iperf3 DaemonSet pods must mount an `emptyDir` volume at `/tmp`. The Store-and-Fetch execution pattern writes iperf3 JSON output to `/tmp/<file>.json` inside the source pod. Without this mount, `readOnlyRootFilesystem: true` causes every pair to fail with "read-only file system". See [`deploy/daemonset.yaml`](deploy/daemonset.yaml) for the reference configuration.
 
 ---
 
@@ -141,7 +143,7 @@ rounds = N − 1  (N even)   or   N  (N odd)
 estimated_duration_seconds = rounds × 15
 ```
 
-The 15-second-per-round constant is: **10 s** (`iperf3 -t 10`, initial attempt) + **5 s** (inter-round cooldown). This is the happy-path estimate. In the event of transient SPDY stream failures, the Fast-Retry strategy may extend individual pair execution by up to ~35 s (3 retries × 8 s + 3 waits × 3 s), but since retries run concurrently with other pairs in the same round the wall-clock impact is bounded by the slowest pair in each round.
+The 15-second-per-round constant is: **10 s** (`iperf3 -t 10`) + **5 s** (inter-round cooldown). This is the happy-path estimate and also the typical case under the Store-and-Fetch architecture: Step A takes ~10 s (iperf3 completes normally and the stream closes), followed by an immediate Step B fetch. In the event of a Tailscale flap during Step A, the pair still takes ~11 s total (the minimum file-wait), so the round wall-clock is unaffected. Step B retries add at most 3 × (10 + 3) = 39 s to a single pair in the pathological case where every cat stream also drops, but this is far outside the norm.
 
 ---
 

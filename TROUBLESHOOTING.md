@@ -315,7 +315,11 @@ The byte-size envelope log (`stdout=N bytes stderr=M bytes err=...`) is preserve
 
 ---
 
-## Bug 7: Silent 0-byte Output — SPDY Stream Severed by Tailscale Mid-Test
+## Bug 7: Silent 0-byte Output — SPDY Stream Severed by Tailscale Mid-Test (History)
+
+> **Note:** Bug 7 documents the root-cause analysis that led to Bug 8's architecture. The fast-retry approach described here has been superseded by the Store-and-Fetch pattern. It is retained for historical reference only.
+
+
 
 ### Symptom
 
@@ -369,4 +373,94 @@ Log sequence for a pair that recovers on the third attempt:
 [Pair 10.0.0.1<->10.0.0.2] Attempt 2/4 (5s) failed: iperf3 produced no output (SPDY stream closed mid-test). Retrying (Attempt 3/4, 5s)...
 [executor] pair 10.0.0.1→10.0.0.2 attempt 3/4 (5s): stdout=4821 bytes stderr=0 bytes err=<nil>
 [Round 2] 10.0.0.1→10.0.0.2 = 918.40 Mbps  |  10.0.0.2→10.0.0.1 = 904.12 Mbps
+```
+
+---
+
+## Bug 8: Architecture Shift — Store-and-Fetch (File-Based Execution)
+
+### Symptom
+
+The fast-retry approach from Bug 7 reduces the failure rate but does not eliminate it. Each retry re-runs iperf3, which races against another Tailscale reconnect. On clusters with frequent key-rotation events the pair can exhaust all 4 attempts and still fail with:
+
+```json
+{ "mbps": 0, "error": "failed after 4 attempts (network unstable): iperf3 produced no output (SPDY stream closed mid-test)" }
+```
+
+Additionally, each retry wastes 5–10 seconds of wall-clock time: even on a single-flap event the pair takes ≥ 18 s (initial 10 s + 3 s wait + 5 s retry) instead of the normal 10 s.
+
+### Root cause (why fast-retry is insufficient)
+
+The fundamental problem is that the **measurement and the result delivery share the same SPDY stream**. The iperf3 JSON payload is streamed in real time back to the executor. A Tailscale flap during the measurement window severs the stream; iperf3's output for that window is lost regardless of how many times we re-run it. Every retry is a new race against the next flap.
+
+### Fix — Store-and-Fetch Architecture
+
+Decouple the iperf3 execution from result delivery using three sequential exec steps:
+
+**Step A — Run & Redirect (fire and wait)**
+
+```sh
+# Executed inside the source pod via SPDY exec:
+iperf3 -c <target> -p <port> -J -t 10 --bidir > /tmp/iperf_<taskID>_R<round>_<src>_<dst>.json 2>/dev/null
+```
+
+The iperf3 output is redirected to a file in `/tmp` (backed by `emptyDir` — see [hard requirement below](#emptydir-tmp-is-a-hard-requirement)). If the SPDY stream drops mid-test, the iperf3 process continues running inside the container; Go simply waits for the remainder of the 11-second minimum window before proceeding.
+
+| Scenario | Behaviour |
+|---|---|
+| SPDY stream drops at 3 s | `podExec` returns early. Go waits 8 more seconds. iperf3 finishes at ~10 s and writes the file. |
+| SPDY stream completes normally | `podExec` returns after ~10 s. Go waits 1 more second (11 s total), then fetches. |
+| iperf3 fails fast ("Connection refused") | Shell exits quickly with error JSON in file. Go waits the remaining 11 s (safe but slightly wasteful). |
+
+**Step B — Fetch (with retry)**
+
+```sh
+cat /tmp/iperf_<taskID>_R<round>_<src>_<dst>.json
+```
+
+This opens a fresh SPDY connection to retrieve the file. If the cat stream itself is dropped (a second Tailscale flap) or the file is not yet ready, the fetch is retried up to 3 more times with a 3-second wait between attempts.
+
+**Step C — Cleanup (always runs via `defer`)**
+
+```sh
+rm -f /tmp/iperf_<taskID>_R<round>_<src>_<dst>.json
+```
+
+Uses `context.Background()` (not the task context) so that a DELETE cancellation does not skip the cleanup and leave stale files in `emptyDir`.
+
+### Why this is strictly better
+
+| Property | Fast-Retry | Store-and-Fetch |
+|---|---|---|
+| Measurement races Tailscale flaps | Yes — each retry is a new race | No — iperf3 completes regardless of stream state |
+| Wasted iperf3 time on flap | 5–10 s per retry × up to 3 retries | 0 — the original run completes |
+| SPDY-resilient result delivery | No | Yes — cat runs over a fresh connection |
+| emptyDir disk usage | None | One JSON file per in-flight pair (≤ 16 KB each; cleaned up on exit) |
+| Cancellation latency | Immediate (ctx cancel) | Immediate — cancelled during Step A wait or Step B fetch retry |
+
+### Log sequence for a pair whose Step A stream dropped then Step B succeeded on first fetch
+
+```
+[executor] pair 10.0.0.1→10.0.0.2 Step A: elapsed=3.21s err=stream error
+[executor] pair 10.0.0.1→10.0.0.2: Step A returned after 3.21s; waiting 7.79s more before fetch
+[executor] pair 10.0.0.1→10.0.0.2 Step B attempt 1/4: stdout=13481 bytes err=<nil>
+[executor] pair 10.0.0.1→10.0.0.2: cleaned up /tmp/iperf_<taskID>_R2_10.0.0.1_10.0.0.2.json
+[Round 2] 10.0.0.1→10.0.0.2 = 921.40 Mbps  |  10.0.0.2→10.0.0.1 = 907.83 Mbps
+```
+
+### `emptyDir` `/tmp` is a hard requirement
+
+The DaemonSet pod (and the integration test DaemonSet) **must** mount an `emptyDir` volume at `/tmp`. Without it the `readOnlyRootFilesystem: true` security context prevents Step A from writing the output file, causing every pair to fail with a "read-only file system" error. See also Bug 1.
+
+```yaml
+volumes:
+  - name: tmp
+    emptyDir: {}
+containers:
+  - name: iperf3
+    volumeMounts:
+      - name: tmp
+        mountPath: /tmp
+    securityContext:
+      readOnlyRootFilesystem: true  # safe — /tmp is writable via emptyDir
 ```
