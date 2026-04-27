@@ -255,12 +255,13 @@ curl -s http://localhost:8080/api/v1/network-measure/3f2a1b4c-… | jq
 | `matrix[Source][Target]` | A `BandwidthData` cell describing the **single directed link** Source→Target |
 | `matrix[Source][Target].mbps` | Bandwidth (Mbit/s) that **`Target` successfully received from `Source`** |
 | `matrix[Source][Target].error` | Non-empty string when this specific directed link failed; `mbps` is then 0 |
+| `matrix[X][X]` (diagonal) | Self-test placeholder: `mbps=0`, `error="self-test (no measurement performed)"` |
 
 Notes:
 
 - **Row = sender, column = receiver.** `matrix[A][B]` and `matrix[B][A]` are independent measurements of opposite directions, populated from the same `--bidir` exec but never duplicated.
-- **Diagonal cells (`matrix[X][X]`) are absent** — a node never tests against itself.
-- A complete result has exactly **`N × (N − 1)`** directed cells.
+- **Diagonal cells (`matrix[X][X]`) are populated with a self-test marker** — `mbps=0` with a non-empty `error` field — so the matrix is a complete N×N structure rather than the sparse N×(N−1) shape.
+- A complete result has exactly **`N × N`** cells: `N × (N − 1)` measured directional links plus `N` self-test markers.
 - Sender-side (egress) figures are deliberately not exposed: on a healthy link they are bounded by the receiver and add noise without information.
 
 **`200 OK` — failed:**

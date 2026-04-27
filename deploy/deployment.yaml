@@ -24,7 +24,7 @@ spec:
           # Build and push this image before applying:
           #   docker build -t netperf-api:latest .
           #   kind load docker-image netperf-api:latest   # or push to a registry
-          image: docker.io/loihoangthanh1411/netperf-api:v1.0 
+          image: docker.io/loihoangthanh1411/netperf-api:v1.1 
           imagePullPolicy: IfNotPresent
 
           ports:

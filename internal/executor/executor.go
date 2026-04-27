@@ -79,7 +79,18 @@ const (
 	// already occupies 5201 on the same hosts (e.g. during e2e tests run alongside
 	// a production DaemonSet).
 	defaultServerPort = 5201
+
+	// SelfTestErrorMessage is written into matrix[X][X] for every node X.
+	// It is exposed so consumers can recognise the canonical "node measures
+	// itself" placeholder rather than special-casing diagonal absence.
+	SelfTestErrorMessage = "self-test (no measurement performed)"
 )
+
+// ExecFunc is the signature of the pod-exec layer used by execPair.
+// In production this is *Executor.podExec, which performs a real SPDY
+// remotecommand stream. Tests inject a deterministic fake via SetExecFunc to
+// drive the executor without a Kubernetes cluster.
+type ExecFunc func(ctx context.Context, podName string, cmd []string) (stdout, stderr string, err error)
 
 // iperf3ServerPort returns the TCP port the iperf3 server DaemonSet is
 // listening on. Reads IPERF3_PORT so integration tests can use an alternate
@@ -141,21 +152,80 @@ type Result struct {
 }
 
 // Executor holds the Kubernetes client and drives the full measurement lifecycle.
+//
+// The execFunc, fileWaitOverride, fetchRetryWaitOverride, and roundCooldownOverride
+// fields exist solely to support unit tests: production code uses the SPDY-based
+// podExec and the package-level timing constants. See SetExecFunc and
+// SetTimingForTesting for the test-only entry points.
 type Executor struct {
 	client    *k8sclient.Client
 	namespace string // K8s namespace where iperf3 DaemonSet pods live
+
+	// execFunc is the function used to run commands inside DaemonSet pods.
+	// Defaults to (*Executor).podExec; tests override via SetExecFunc.
+	execFunc ExecFunc
+
+	// Timing overrides — zero means "use the package-level default".
+	fileWaitOverride       time.Duration
+	fetchRetryWaitOverride time.Duration
+	roundCooldownOverride  time.Duration
 }
 
 // New constructs an Executor targeting the default namespace.
 func New(c *k8sclient.Client) *Executor {
-	return &Executor{client: c, namespace: Namespace}
+	e := &Executor{client: c, namespace: Namespace}
+	e.execFunc = e.podExec
+	return e
 }
 
 // NewForNamespace constructs an Executor targeting an arbitrary namespace.
 // Used by integration tests to operate inside an isolated temporary namespace
 // without touching the production namespace.
 func NewForNamespace(c *k8sclient.Client, ns string) *Executor {
-	return &Executor{client: c, namespace: ns}
+	e := &Executor{client: c, namespace: ns}
+	e.execFunc = e.podExec
+	return e
+}
+
+// SetExecFunc overrides the pod-exec layer with a custom function.
+// Production code never calls this; it exists so unit tests can replace the
+// SPDY remotecommand stream with a deterministic fake.
+func (e *Executor) SetExecFunc(fn ExecFunc) {
+	e.execFunc = fn
+}
+
+// SetTimingForTesting reduces the inter-step waits so unit tests do not have
+// to spend 11 s on every Step A or 3 s on every fetch retry. A zero value for
+// any parameter restores the production default for that timing. Production
+// code never calls this.
+func (e *Executor) SetTimingForTesting(fileWait, fetchRetryWait, roundCooldown time.Duration) {
+	e.fileWaitOverride = fileWait
+	e.fetchRetryWaitOverride = fetchRetryWait
+	e.roundCooldownOverride = roundCooldown
+}
+
+// effFileWait returns the effective file-wait duration after applying overrides.
+func (e *Executor) effFileWait() time.Duration {
+	if e.fileWaitOverride > 0 {
+		return e.fileWaitOverride
+	}
+	return iperfFileWait
+}
+
+// effFetchRetryWait returns the effective fetch-retry wait after overrides.
+func (e *Executor) effFetchRetryWait() time.Duration {
+	if e.fetchRetryWaitOverride > 0 {
+		return e.fetchRetryWaitOverride
+	}
+	return iperfFetchRetryWait
+}
+
+// effRoundCooldown returns the effective round cooldown after overrides.
+func (e *Executor) effRoundCooldown() time.Duration {
+	if e.roundCooldownOverride > 0 {
+		return e.roundCooldownOverride
+	}
+	return roundCooldown
 }
 
 // DiscoverNodes performs a pod-based, data-plane-aware discovery of all nodes
@@ -297,11 +367,16 @@ func (e *Executor) run(ctx context.Context, taskID string, snapshot *NodeSnapsho
 	log.Printf("[executor] schedule: %d rounds for %d nodes", len(sched), len(nodeIPs))
 
 	// ── Allocate the directional matrix ──────────────────────────────────────
-	// One row per node, each row is an inner map keyed by Target. Diagonal
-	// cells are deliberately never inserted — a node never measures itself.
+	// One row per node, each row is an inner map keyed by Target. The diagonal
+	// cell matrix[X][X] is pre-populated with a self-test marker so consumers
+	// receive a complete N×N structure without having to special-case absence.
+	// This pre-population happens entirely on the calling goroutine before any
+	// pair worker is launched, so there is no write race against execPair.
 	matrix := make(map[string]map[string]*BandwidthData, len(nodeIPs))
 	for _, ip := range nodeIPs {
-		matrix[ip] = make(map[string]*BandwidthData, len(nodeIPs)-1)
+		row := make(map[string]*BandwidthData, len(nodeIPs))
+		row[ip] = &BandwidthData{Error: SelfTestErrorMessage}
+		matrix[ip] = row
 	}
 
 	for roundIdx, round := range sched {
@@ -322,6 +397,18 @@ func (e *Executor) run(ctx context.Context, taskID string, snapshot *NodeSnapsho
 
 		// Barrier: wait for ALL pairs in this round before proceeding.
 		wg.Wait()
+
+		// If the parent context was cancelled at any point during this round
+		// (DELETE /cancel, server shutdown, etc.), surface that error to the
+		// caller now. Without this check, a cancellation that landed during a
+		// round's pair execution would be buried in an individual matrix cell's
+		// error string, and the task would terminate with status=completed even
+		// though the user explicitly cancelled it. The integration test
+		// TestE2E_CancelMidFlight depends on this status transitioning to
+		// "canceled" rather than "completed".
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
 
 		// Each --bidir exec produces TWO directional matrix cells, one per
 		// direction. Errors propagate to BOTH cells (we cannot trust either
@@ -348,9 +435,10 @@ func (e *Executor) run(ctx context.Context, taskID string, snapshot *NodeSnapsho
 		// immediately when the context is cancelled (e.g. DELETE /cancel).
 		// Pair-level failures do NOT skip or shorten this cooldown.
 		if roundIdx < len(sched)-1 {
-			log.Printf("[executor] cooldown %v before next round", roundCooldown)
+			cd := e.effRoundCooldown()
+			log.Printf("[executor] cooldown %v before next round", cd)
 			select {
-			case <-time.After(roundCooldown):
+			case <-time.After(cd):
 			case <-ctx.Done():
 				return nil, ctx.Err()
 			}
@@ -418,7 +506,7 @@ func (e *Executor) execPair(ctx context.Context, taskID string, roundIdx int, p 
 	defer func() {
 		cleanCtx, cleanCancel := context.WithTimeout(context.Background(), iperfCleanupTimeout)
 		defer cleanCancel()
-		_, _, _ = e.podExec(cleanCtx, srcPod, []string{"rm", "-f", filename})
+		_, _, _ = e.execFunc(cleanCtx, srcPod, []string{"rm", "-f", filename})
 		log.Printf("[executor] pair %s→%s: cleaned up %s", p.Source, p.Target, filename)
 	}()
 
@@ -433,7 +521,7 @@ func (e *Executor) execPair(ctx context.Context, taskID string, roundIdx int, p 
 	)
 	stepACtx, stepACancel := context.WithTimeout(ctx, iperfStepATimeout)
 	stepAStart := time.Now()
-	_, _, stepAErr := e.podExec(stepACtx, srcPod, []string{"sh", "-c", shellCmd})
+	_, _, stepAErr := e.execFunc(stepACtx, srcPod, []string{"sh", "-c", shellCmd})
 	stepACancel()
 	stepAElapsed := time.Since(stepAStart)
 
@@ -442,9 +530,10 @@ func (e *Executor) execPair(ctx context.Context, taskID string, roundIdx int, p 
 
 	// Guarantee the file is fully written before we attempt to read it.
 	// If the stream returned early (e.g. Tailscale flap at 3 s), iperf3 still
-	// needs up to 10 s total; we wait for the remainder of iperfFileWait.
-	if stepAElapsed < iperfFileWait {
-		remaining := iperfFileWait - stepAElapsed
+	// needs up to 10 s total; we wait for the remainder of the file-wait window.
+	fileWait := e.effFileWait()
+	if stepAElapsed < fileWait {
+		remaining := fileWait - stepAElapsed
 		log.Printf("[executor] pair %s→%s: Step A returned after %v; waiting %v more before fetch",
 			p.Source, p.Target,
 			stepAElapsed.Round(time.Millisecond),
@@ -462,10 +551,11 @@ func (e *Executor) execPair(ctx context.Context, taskID string, roundIdx int, p 
 	// (file not yet written, or cat stream itself was dropped by a Tailscale
 	// flap). After all attempts, an empty response means the test genuinely failed.
 	maxFetchAttempts := iperfFetchRetries + 1
+	fetchWait := e.effFetchRetryWait()
 	var stdout string
 	for attempt := 1; attempt <= maxFetchAttempts; attempt++ {
 		fetchCtx, fetchCancel := context.WithTimeout(ctx, iperfFetchTimeout)
-		out, _, fetchErr := e.podExec(fetchCtx, srcPod, []string{"cat", filename})
+		out, _, fetchErr := e.execFunc(fetchCtx, srcPod, []string{"cat", filename})
 		fetchCancel()
 
 		log.Printf("[executor] pair %s→%s Step B attempt %d/%d: stdout=%d bytes err=%v",
@@ -483,9 +573,9 @@ func (e *Executor) execPair(ctx context.Context, taskID string, roundIdx int, p 
 
 		if attempt < maxFetchAttempts {
 			log.Printf("[executor] pair %s→%s: output not ready on fetch attempt %d/%d, waiting %v",
-				p.Source, p.Target, attempt, maxFetchAttempts, iperfFetchRetryWait)
+				p.Source, p.Target, attempt, maxFetchAttempts, fetchWait)
 			select {
-			case <-time.After(iperfFetchRetryWait):
+			case <-time.After(fetchWait):
 			case <-ctx.Done():
 				pr.Error = fmt.Sprintf("cancelled while waiting for fetch retry %d: %v", attempt+1, ctx.Err())
 				return pr

@@ -2,7 +2,7 @@
 //
 // POST   /api/v1/network-measure            — start a test, returns 202 + task_id
 // GET    /api/v1/network-measure/{task_id}  — poll status / retrieve result
-// DELETE /api/v1/network-measure/{task_id}  — cancel a running test
+// DELETE /api/v1/network-measure/{task_id}  — evict a terminal task from memory
 // GET    /healthz                           — liveness / readiness probe
 package api
 
@@ -38,7 +38,7 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /healthz", h.healthz)
 	mux.HandleFunc("POST /api/v1/network-measure", h.startMeasure)
 	mux.HandleFunc("GET /api/v1/network-measure/{task_id}", h.getMeasure)
-	mux.HandleFunc("DELETE /api/v1/network-measure/{task_id}", h.cancelMeasure)
+	mux.HandleFunc("DELETE /api/v1/network-measure/{task_id}", h.deleteMeasure)
 }
 
 // healthz is a simple liveness/readiness probe target.
@@ -163,18 +163,17 @@ func (h *Handler) getMeasure(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, resp)
 }
 
-// cancelMeasure handles DELETE /api/v1/network-measure/{task_id}.
+// deleteMeasure handles DELETE /api/v1/network-measure/{task_id}.
 //
-// It calls the stored CancelFunc for the task, which propagates context
-// cancellation down into every in-flight remotecommand.StreamWithContext call.
-// The background goroutine will drain, mark the task as "canceled", and clean
-// up the cancel func itself via defer.
+// Evicts a terminal task from the in-memory store to free RAM immediately,
+// without waiting for the TTL sweeper. Active (pending/running) tasks are
+// rejected so callers cannot remove in-flight state.
 //
 // Responses:
-//   - 202 Accepted  — cancel signal sent; task will transition to "canceled"
-//   - 404 Not Found — unknown task_id
-//   - 409 Conflict  — task already finished (completed / failed / canceled)
-func (h *Handler) cancelMeasure(w http.ResponseWriter, r *http.Request) {
+//   - 200 OK          — task evicted from store
+//   - 400 Bad Request — task is still pending or running; cannot delete
+//   - 404 Not Found   — unknown task_id
+func (h *Handler) deleteMeasure(w http.ResponseWriter, r *http.Request) {
 	taskID := r.PathValue("task_id")
 
 	task, ok := h.store.Get(taskID)
@@ -183,32 +182,18 @@ func (h *Handler) cancelMeasure(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Guard against cancelling a task that already reached a terminal state.
-	// This check is best-effort; the authoritative answer is whether a cancel
-	// func is still registered (store.Cancel uses LoadAndDelete atomically).
-	switch task.Status {
-	case store.StatusCompleted, store.StatusFailed, store.StatusCanceled:
-		writeJSON(w, http.StatusConflict, map[string]interface{}{
-			"error":  "task is not running",
+	if task.Status == store.StatusRunning || task.Status == store.StatusPending {
+		writeJSON(w, http.StatusBadRequest, map[string]interface{}{
+			"error":  "task is still active; wait for it to finish before deleting",
 			"status": task.Status,
 		})
 		return
 	}
 
-	// store.Cancel invokes the CancelFunc and removes it atomically.
-	// Returns false only if the task finished between our status check above
-	// and this call — a harmless race that is safe to surface as a 409.
-	if !h.store.Cancel(taskID) {
-		writeJSON(w, http.StatusConflict, map[string]interface{}{
-			"error":  "task already finished",
-			"status": task.Status,
-		})
-		return
-	}
-
-	writeJSON(w, http.StatusAccepted, map[string]string{
+	h.store.Delete(taskID)
+	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"task_id": taskID,
-		"message": "cancellation signal sent; poll GET to confirm status=canceled",
+		"message": "task deleted",
 	})
 }
 
