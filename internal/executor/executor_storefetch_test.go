@@ -332,9 +332,10 @@ func TestStoreAndFetch_RetryRescue_SucceedsOnThirdAttempt(t *testing.T) {
 }
 
 // TestStoreAndFetch_AllFetchAttemptsFail: every fetch returns empty.  All four
-// attempts (initial + 3 retries) are exhausted; the matrix records mbps=0 with
-// a descriptive error and Step C still runs.
-func TestStoreAndFetch_AllFetchAttemptsFail_MbpsZero(t *testing.T) {
+// attempts (initial + 3 retries) are exhausted; the matrix cell carries a
+// descriptive error and the Go struct Mbps field is 0 (serialised as null in
+// JSON — verified below).  Step C still runs.
+func TestStoreAndFetch_AllFetchAttemptsFail(t *testing.T) {
 	e, fe := newFakeExecutor(t)
 	fe.handler = func(c fakeCall) (string, string, error) {
 		// Step A and Step C succeed; Step B always returns empty.
@@ -353,14 +354,27 @@ func TestStoreAndFetch_AllFetchAttemptsFail_MbpsZero(t *testing.T) {
 		if cell == nil {
 			t.Fatalf("matrix[%s][%s] missing", ips[0], ips[1])
 		}
+		// Internal Go value is 0 (float64 zero-value on the struct).
 		if cell.Mbps != 0 {
-			t.Errorf("matrix[%s][%s].Mbps=%v, want 0", ips[0], ips[1], cell.Mbps)
+			t.Errorf("matrix[%s][%s].Mbps (struct)=%v, want 0", ips[0], ips[1], cell.Mbps)
 		}
 		if cell.Error == "" {
 			t.Errorf("matrix[%s][%s].Error empty, want a descriptive failure", ips[0], ips[1])
 		}
 		if !strings.Contains(cell.Error, "fetch") {
 			t.Errorf("matrix[%s][%s].Error=%q, want it to mention fetch attempts", ips[0], ips[1], cell.Error)
+		}
+		// JSON output must be {"mbps":null,"error":"..."} — not {"mbps":0,...}.
+		b, err := json.Marshal(cell)
+		if err != nil {
+			t.Fatalf("marshal cell: %v", err)
+		}
+		js := string(b)
+		if !strings.Contains(js, `"mbps":null`) {
+			t.Errorf("matrix[%s][%s] JSON: want mbps:null, got %s", ips[0], ips[1], js)
+		}
+		if strings.Contains(js, `"mbps":0`) {
+			t.Errorf("matrix[%s][%s] JSON: must not contain mbps:0, got %s", ips[0], ips[1], js)
 		}
 	}
 
@@ -443,7 +457,7 @@ func TestStoreAndFetch_CleanupAlwaysCalled(t *testing.T) {
 			},
 		},
 		{
-			name: "all_attempts_empty",
+			name:    "all_attempts_empty",
 			handler: func(c fakeCall) (string, string, error) { return "", "", nil },
 		},
 	}
@@ -717,7 +731,7 @@ func TestRun_PartialFailures_OnePairBreaksRoundContinues(t *testing.T) {
 					t.Errorf("matrix[%s][%s] should be errored (touches %s)", src, tgt, failTarget)
 				}
 				if cell.Mbps != 0 {
-					t.Errorf("matrix[%s][%s].Mbps=%v, want 0 on failure", src, tgt, cell.Mbps)
+					t.Errorf("matrix[%s][%s].Mbps (struct)=%v, want 0 on failure (JSON will be null)", src, tgt, cell.Mbps)
 				}
 			} else {
 				if cell.Error != "" {
@@ -776,7 +790,8 @@ func TestExecPair_PodNotInSnapshot_NoExecCalls(t *testing.T) {
 // via Step B.  Each row supplies a malicious / malformed Step B response and
 // asserts that the executor:
 //   - returns task status=completed (does not crash, does not return Failed)
-//   - the matrix cell has mbps=0 and a non-empty error
+//   - the matrix cell has an internal zero value and a non-empty error
+//     (API JSON renders mbps as null)
 //   - Step C cleanup still runs
 func TestStoreAndFetch_CorruptOrInvalidOutput(t *testing.T) {
 	tests := []struct {
@@ -983,8 +998,8 @@ func TestExecPair_FilenameUniqueness_AcrossRoundsAndPairs(t *testing.T) {
 			t.Errorf("Step A shell missing redirect: %q", shellCmd)
 			continue
 		}
-		rest := shellCmd[idx+2:]                 // strip "> "
-		end := strings.Index(rest, " ")          // up to next space
+		rest := shellCmd[idx+2:]        // strip "> "
+		end := strings.Index(rest, " ") // up to next space
 		if end < 0 {
 			end = len(rest)
 		}

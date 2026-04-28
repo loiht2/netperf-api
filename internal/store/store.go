@@ -50,23 +50,28 @@ func New() *Store { return &Store{} }
 
 // ── Task operations ───────────────────────────────────────────────────────────
 
-// Set stores (or replaces) a task. When the task status is terminal and
+// Set stores (or replaces) a task. A defensive copy is stored so the caller
+// retains ownership of its pointer and concurrent readers of the stored value
+// are never exposed to in-place writes. When the task status is terminal and
 // FinishedAt has not been set yet, it is stamped with the current UTC time so
 // the TTL sweeper has an accurate age reference.
 func (s *Store) Set(id string, t *Task) {
-	if isTerminal(t.Status) && t.FinishedAt == nil {
+	stored := *t // defensive copy — isolates stored pointer from caller's pointer
+	if isTerminal(stored.Status) && stored.FinishedAt == nil {
 		now := time.Now().UTC()
-		t.FinishedAt = &now
+		stored.FinishedAt = &now
 	}
-	s.tasks.Store(id, t)
+	s.tasks.Store(id, &stored)
 }
 
+// Get returns a copy of the stored task so callers cannot mutate shared state.
 func (s *Store) Get(id string) (*Task, bool) {
 	v, ok := s.tasks.Load(id)
 	if !ok {
 		return nil, false
 	}
-	return v.(*Task), true
+	t := *v.(*Task)
+	return &t, true
 }
 
 // Delete removes a task and its associated cancel func from both maps.

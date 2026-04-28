@@ -190,7 +190,7 @@ if err := json.Unmarshal(raw, &obj); err == nil {
 
 ### Additional hardening applied at the same time
 
-- **Never `continue` silently on parse error.** Every failure path in `execPair` writes a diagnostic `BandwidthData{Error: "..."}` into BOTH directional matrix cells for the affected pair so callers can see exactly which directed link is broken.
+- **Never `continue` silently on parse error.** Every failure path in `execPair` writes a diagnostic `BandwidthData{Error: "..."}` into BOTH directional matrix cells for the affected pair so callers can see exactly which directed link is broken. In API JSON, errored cells render `"mbps": null`.
 - **`json.RawMessage` for the top-level `end` field.** `Output.End` is kept as `json.RawMessage` and decoded lazily by `ParseEnd`. This makes the parser tolerant of missing or differently-typed fields across iperf3 versions, and prevents a missing `sum_sent_bidir_reverse` from zeroing the whole measurement.
 
 > **Note:** an earlier iteration logged raw iperf3 stdout unconditionally for every pair — see Bug 6 below for why that was reverted.
@@ -324,7 +324,7 @@ The byte-size envelope log (`stdout=N bytes stderr=M bytes err=...`) is preserve
 ### Symptom
 
 Intermittently (not on every run, not on every pair), one or more matrix cells contain
-`{"mbps": 0, "error": "iperf3 produced no output (SPDY stream closed mid-test)"}` even though:
+`{"mbps": null, "error": "iperf3 produced no output (SPDY stream closed mid-test)"}` even though:
 
 - The source pod is `Running` and `PodReady=True`.
 - The target pod is responding to other pairs in the same round.
@@ -356,12 +356,12 @@ This is why the condition is intermittent: it requires a Tailscale reconnect (no
 
 Rationale for the shorter retry duration: by the time a Tailscale reconnect has fired, the tunnel is typically re-established within 1–2 seconds. A 5-second iperf3 run is sufficient to confirm link health while keeping the total worst-case time for one pair under ~50 seconds (well within the round cooldown budget).
 
-Each attempt creates its own `context.WithTimeout` derived from the task-level context, so a DELETE cancellation still propagates immediately. If the outer context is cancelled between attempts, the retry loop exits without delay.
+Each attempt creates its own `context.WithTimeout` derived from the task-level context, so a context cancellation still propagates immediately. If the outer context is cancelled between attempts, the retry loop exits without delay.
 
 Terminal failure message (all 4 attempts exhausted):
 
 ```json
-{ "mbps": 0, "error": "failed after 4 attempts (network unstable): iperf3 produced no output (SPDY stream closed mid-test)" }
+{ "mbps": null, "error": "failed after 4 attempts (network unstable): iperf3 produced no output (SPDY stream closed mid-test)" }
 ```
 
 Log sequence for a pair that recovers on the third attempt:
@@ -384,7 +384,7 @@ Log sequence for a pair that recovers on the third attempt:
 The fast-retry approach from Bug 7 reduces the failure rate but does not eliminate it. Each retry re-runs iperf3, which races against another Tailscale reconnect. On clusters with frequent key-rotation events the pair can exhaust all 4 attempts and still fail with:
 
 ```json
-{ "mbps": 0, "error": "failed after 4 attempts (network unstable): iperf3 produced no output (SPDY stream closed mid-test)" }
+{ "mbps": null, "error": "failed after 4 attempts (network unstable): iperf3 produced no output (SPDY stream closed mid-test)" }
 ```
 
 Additionally, each retry wastes 5–10 seconds of wall-clock time: even on a single-flap event the pair takes ≥ 18 s (initial 10 s + 3 s wait + 5 s retry) instead of the normal 10 s.
@@ -426,7 +426,7 @@ This opens a fresh SPDY connection to retrieve the file. If the cat stream itsel
 rm -f /tmp/iperf_<taskID>_R<round>_<src>_<dst>.json
 ```
 
-Uses `context.Background()` (not the task context) so that a DELETE cancellation does not skip the cleanup and leave stale files in `emptyDir`.
+Uses `context.Background()` (not the task context) so that a context cancellation does not skip the cleanup and leave stale files in `emptyDir`.
 
 ### Why this is strictly better
 

@@ -24,20 +24,11 @@ spec:
           # Build and push this image before applying:
           #   docker build -t netperf-api:latest .
           #   kind load docker-image netperf-api:latest   # or push to a registry
-          image: docker.io/loihoangthanh1411/netperf-api:v1.3 
-          imagePullPolicy: IfNotPresent
+          image: docker.io/loihoangthanh1411/netperf-api:v1.5
+          imagePullPolicy: Always
 
           ports:
             - containerPort: 8080
-
-          env:
-            # Override to match your cluster's worker-node label scheme.
-            # kubeadm:  node-role.kubernetes.io/worker=true
-            # GKE:      cloud.google.com/gke-nodepool=<pool-name>
-            # EKS:      eks.amazonaws.com/nodegroup=<group-name>
-            # To target ALL nodes (including control-plane), set this to "".
-            - name: WORKER_NODE_LABEL
-              value: "node-role.kubernetes.io/worker=true"
 
           resources:
             requests:

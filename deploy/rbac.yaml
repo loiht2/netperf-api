@@ -15,17 +15,15 @@ metadata:
 
 ---
 # ClusterRole grants the minimum permissions required by the executor:
-#   - nodes          : discover Ready nodes and their InternalIPs
-#   - pods           : locate the iperf3 DaemonSet pod running on each node
+#   - pods           : list iperf3 DaemonSet pods and look up pod names for exec
 #   - pods/exec      : exec into those pods (the SPDY upgrade target)
+# Node-level RBAC is not needed: discovery uses pod listing (app=iperf3-server),
+# not node listing. HostIP is read from pod.Status.HostIP.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
   name: netperf-api-role
 rules:
-  - apiGroups: [""]
-    resources: ["nodes"]
-    verbs: ["get", "list", "watch"]
   - apiGroups: [""]
     resources: ["pods"]
     verbs: ["get", "list", "watch"]

@@ -108,9 +108,8 @@ func (h *Handler) startMeasure(w http.ResponseWriter, r *http.Request) {
 	}
 	h.store.Set(taskID, task)
 
-	// context.WithCancel lets the DELETE endpoint abort mid-flight execs.
-	// The cancel func is stored before the goroutine starts to eliminate the
-	// race where DELETE arrives before SetCancel is called.
+	// The cancel func is stored before the goroutine starts so that any caller
+	// with access to the store (e.g. integration tests) can abort the run.
 	ctx, cancel := context.WithCancel(context.Background())
 	h.store.SetCancel(taskID, cancel)
 

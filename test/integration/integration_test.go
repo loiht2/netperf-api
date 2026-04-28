@@ -11,12 +11,14 @@
 // Requirements:
 //   - A reachable cluster via ~/.kube/config (or $KUBECONFIG).
 //   - The test runner's kubeconfig identity must have:
-//       - nodes: get, list, watch
+//       - nodes: list, watch            (pre-flight skip check via countWorkerNodes)
 //       - pods: get, list, watch (cluster-wide)
 //       - pods/exec: create   (cluster-wide)
 //       - namespaces: create, delete
 //       - daemonsets: create, delete, get, watch
 //   - Cluster-admin satisfies all of the above.
+//   - Note: the deployed application ServiceAccount does NOT need node permissions;
+//     node listing is only used here to skip tests early on small clusters.
 package integration_test
 
 import (
@@ -400,11 +402,15 @@ func TestE2E_FullMeasurementCycle(t *testing.T) {
 
 	// 2. Matrix shape: N rows, N-1 columns each, no diagonal entries.
 	//    Total cells = N*(N-1) directed links.
-	if got := len(result.Matrix); got != nNodes {
-		t.Errorf("want %d matrix rows, got %d", nNodes, got)
+	// Use len(snapshot.IPs) — the count of discovered, measurement-ready pods —
+	// not the raw cluster node count, which can include nodes without a running
+	// iperf3 pod.
+	measuredN := len(snapshot.IPs)
+	if got := len(result.Matrix); got != measuredN {
+		t.Errorf("want %d matrix rows (measured nodes), got %d", measuredN, got)
 	}
 	totalCells := 0
-	wantPerRow := nNodes - 1
+	wantPerRow := measuredN - 1
 	for src, row := range result.Matrix {
 		if cell, exists := row[src]; exists {
 			t.Errorf("diagonal matrix[%s][%s] must be absent, got %+v", src, src, cell)
@@ -414,8 +420,8 @@ func TestE2E_FullMeasurementCycle(t *testing.T) {
 		}
 		totalCells += len(row)
 	}
-	if want := nNodes * (nNodes - 1); totalCells != want {
-		t.Errorf("want %d total cells (N*(N-1) for %d nodes), got %d", want, nNodes, totalCells)
+	if want := measuredN * (measuredN - 1); totalCells != want {
+		t.Errorf("want %d total cells (N*(N-1) for %d nodes), got %d", want, measuredN, totalCells)
 	}
 
 	// 3. Every directed link must carry > 0 Mbps and no error.
@@ -610,16 +616,11 @@ func TestE2E_GlobalLock409Conflict(t *testing.T) {
 		}
 	}
 
-	// ── Clean up: DELETE the running task so this test does not block 45 s ───
-	delReq, _ := http.NewRequest(http.MethodDelete,
-		srv.URL+"/api/v1/network-measure/"+taskID, nil)
-	delResp, err := http.DefaultClient.Do(delReq)
-	if err != nil {
-		t.Fatalf("DELETE: %v", err)
-	}
-	delResp.Body.Close()
-	if delResp.StatusCode != http.StatusAccepted {
-		t.Errorf("DELETE: want 202, got %d", delResp.StatusCode)
+	// ── Clean up: cancel the running task so this test does not block 45 s ────
+	// DELETE rejects active tasks (400); use the store's cancel func directly,
+	// mirroring what TestE2E_CancelMidFlight does.
+	if !st.Cancel(taskID) {
+		t.Log("Cancel returned false — task may have already completed naturally")
 	}
 
 	// Wait for the task to actually transition to canceled / failed before
@@ -635,5 +636,5 @@ func TestE2E_GlobalLock409Conflict(t *testing.T) {
 		}
 		time.Sleep(500 * time.Millisecond)
 	}
-	t.Fatal("task did not reach a terminal state within 2 minutes after DELETE")
+	t.Fatal("task did not reach a terminal state within 2 minutes after cancellation")
 }

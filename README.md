@@ -20,17 +20,12 @@ sequenceDiagram
     alt Another test is already running
         API  -->> CLI : 409 Conflict  { "status": "conflict" }
     else Lock is free — acquire it
-        API  ->>  K8s : List Nodes  (pre-flight, for ETA)
-        K8s  -->> API : N ready nodes
+        API  ->>  K8s : List Pods  (app=iperf3-server, pre-flight snapshot)
+        K8s  -->> API : [pod1@node1, pod2@node2, …, podN@nodeN]
         Note over API: ETA = rounds × 15 s
         API  -->> CLI : 202 Accepted  { task_id, estimated_duration_seconds }
 
-        Note over API: Background goroutine starts (lock held)
-
-        API  ->>  K8s : List Nodes  (WORKER_NODE_LABEL selector)
-        K8s  -->> API : [node1:IP1, node2:IP2, …, nodeN:IPN]
-        API  ->>  K8s : List Pods   (app=iperf3-server)
-        K8s  -->> API : [pod1@node1, pod2@node2, …, podN@nodeN]
+        Note over API: Background goroutine starts (lock held, uses snapshot)
 
         Note over API: GenerateSchedule → N-1 rounds, N(N-1)/2 pairs
 
@@ -102,10 +97,6 @@ kubectl -n netperf-api get pods
 # netperf-api-<hash>             1/1     Running   0          30s
 ```
 
-> **Worker node label** — by default the executor targets nodes labelled
-> `node-role.kubernetes.io/worker=true`. Override via `WORKER_NODE_LABEL` in
-> [`deploy/deployment.yaml`](deploy/deployment.yaml) (see [Configuration](#configuration)).
-
 ### 3 — Run a measurement
 
 ```bash
@@ -144,25 +135,6 @@ estimated_duration_seconds = rounds × 15
 ```
 
 The 15-second-per-round constant is: **10 s** (`iperf3 -t 10`) + **5 s** (inter-round cooldown). This is the happy-path estimate and also the typical case under the Store-and-Fetch architecture: Step A takes ~10 s (iperf3 completes normally and the stream closes), followed by an immediate Step B fetch. In the event of a Tailscale flap during Step A, the pair still takes ~11 s total (the minimum file-wait), so the round wall-clock is unaffected. A fully exhausted Step B fetch path is capped at roughly 15 s: 4 cat attempts × 3 s each, plus 3 retry waits × 1 s.
-
----
-
-## Configuration
-
-Set via the Deployment's `env` block in [`deploy/deployment.yaml`](deploy/deployment.yaml):
-
-```yaml
-env:
-  - name: WORKER_NODE_LABEL
-    value: "node-role.kubernetes.io/worker=true"   # default
-```
-
-| Distribution | Recommended label |
-|---|---|
-| kubeadm | `node-role.kubernetes.io/worker=true` |
-| GKE | `cloud.google.com/gke-nodepool=<pool-name>` |
-| EKS | `eks.amazonaws.com/nodegroup=<group-name>` |
-| All nodes (incl. control-plane) | `kubernetes.io/os=linux` |
 
 ---
 
@@ -253,8 +225,8 @@ curl -s http://localhost:8080/api/v1/network-measure/3f2a1b4c-… | jq
 | Element | Meaning |
 |---|---|
 | `matrix[Source][Target]` | A `BandwidthData` cell describing the **single directed link** Source→Target |
-| `matrix[Source][Target].mbps` | Bandwidth (Mbit/s) that **`Target` successfully received from `Source`** |
-| `matrix[Source][Target].error` | Non-empty string when this specific directed link failed; `mbps` is then 0 |
+| `matrix[Source][Target].mbps` | Bandwidth (Mbit/s) that **`Target` successfully received from `Source`**; `null` when the directed link failed |
+| `matrix[Source][Target].error` | Non-empty string when this specific directed link failed |
 
 Notes:
 
@@ -277,27 +249,35 @@ Notes:
 
 ### `DELETE /api/v1/network-measure/{task_id}`
 
-Cancels a running test. Propagates `context.Canceled` into every in-flight SPDY exec stream; the background goroutine drains and the task transitions to `status: canceled`.
+Evicts a **terminal** task (`completed`, `failed`, or `canceled`) from the in-memory store to free RAM immediately, without waiting for the TTL sweeper. Active tasks (`pending` or `running`) are rejected — wait for natural completion or TTL expiry.
 
 ```bash
 curl -s -X DELETE http://localhost:8080/api/v1/network-measure/3f2a1b4c-… | jq
 ```
 
-**`202 Accepted` — signal sent:**
+**`200 OK` — task evicted:**
 
 ```json
 {
   "task_id": "3f2a1b4c-…",
-  "message": "cancellation signal sent; poll GET to confirm status=canceled"
+  "message": "task deleted"
 }
 ```
 
-**`409 Conflict` — task already in a terminal state:**
+**`400 Bad Request` — task is still active:**
 
 ```json
 {
-  "error":  "task is not running",
-  "status": "completed"
+  "error":  "task is still active; wait for it to finish before deleting",
+  "status": "running"
+}
+```
+
+**`404 Not Found` — unknown or already evicted task_id:**
+
+```json
+{
+  "error": "task not found"
 }
 ```
 
@@ -365,9 +345,10 @@ netperf-api/
 The `netperf-api-sa` ServiceAccount (created by `deploy/rbac.yaml`) requires:
 
 ```
-nodes       : get, list, watch
 pods        : get, list, watch
 pods/exec   : create   ← required for the SPDY exec subresource
 ```
 
-The integration tests run under the kubeconfig user's credentials and require the same permissions cluster-wide. A `cluster-admin` ClusterRoleBinding satisfies all requirements.
+Node-level permissions are **not** required by the application. Discovery lists `app=iperf3-server` pods and reads `pod.Status.HostIP` — no Node API calls are made.
+
+The integration tests additionally require `nodes: list, watch` (cluster-wide) for the pre-flight skip check (`countWorkerNodes`). A `cluster-admin` ClusterRoleBinding satisfies all requirements.

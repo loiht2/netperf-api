@@ -314,20 +314,22 @@ func TestBandwidthData_JSONShape_HappyPath(t *testing.T) {
 }
 
 func TestBandwidthData_JSONShape_ErrorOmitsEmpty(t *testing.T) {
-	// With no error, the error field must be absent (omitempty) so the JSON
-	// stays clean for the common success case.
+	// With no error, the error field must be absent (omitempty) and mbps must
+	// be the numeric zero — NOT null. Zero bandwidth is a valid measurement
+	// result; null is reserved exclusively for the error path.
 	d := executor.BandwidthData{Mbps: 0}
 	got := mustMarshal(t, d)
-	if strings.Contains(got, "error") {
-		t.Errorf("empty error should be omitted, got %s", got)
+	if got != `{"mbps":0}` {
+		t.Errorf("zero-bandwidth cell: want {\"mbps\":0}, got %s", got)
 	}
 }
 
 func TestBandwidthData_JSONShape_ErrorPresent(t *testing.T) {
-	// Error path: Mbps is 0 (no data) and the error string is surfaced.
+	// Error path: mbps is null (no trustworthy measurement) and the error
+	// string is surfaced.
 	d := executor.BandwidthData{Error: "iperf3 reported: Connection refused"}
 	got := mustMarshal(t, d)
-	if got != `{"mbps":0,"error":"iperf3 reported: Connection refused"}` {
+	if got != `{"mbps":null,"error":"iperf3 reported: Connection refused"}` {
 		t.Errorf("unexpected JSON shape: %s", got)
 	}
 }
@@ -363,6 +365,48 @@ func TestResult_JSONShape_DirectionalMatrix(t *testing.T) {
 		if strings.Contains(got, forbidden) {
 			t.Errorf("forbidden %q leaked into JSON: %s", forbidden, got)
 		}
+	}
+}
+
+// TestResult_JSONShape_ErrorCell_MbpsIsNull verifies the end-to-end behaviour
+// when a pair exec fails: the matrix cell must serialise as
+// {"mbps":null,"error":"..."} — never {"mbps":0,...}.
+// This lets API consumers distinguish a measurement failure from a genuinely
+// zero-bandwidth link without any out-of-band signalling.
+func TestResult_JSONShape_ErrorCell_MbpsIsNull(t *testing.T) {
+	r := executor.Result{
+		Nodes: []string{"10.0.0.1", "10.0.0.2", "10.0.0.3"},
+		Matrix: map[string]map[string]*executor.BandwidthData{
+			"10.0.0.1": {
+				"10.0.0.2": {Mbps: 910.5},                          // success
+				"10.0.0.3": {Error: "iperf3 connection refused"},    // failure
+			},
+			"10.0.0.2": {
+				"10.0.0.1": {Mbps: 920.7},
+				"10.0.0.3": {Error: "iperf3 connection refused"},
+			},
+			"10.0.0.3": {
+				"10.0.0.1": {Error: "iperf3 connection refused"},
+				"10.0.0.2": {Error: "iperf3 connection refused"},
+			},
+		},
+	}
+	got := mustMarshal(t, r)
+
+	// Error cells must carry null, not 0.
+	if !strings.Contains(got, `"mbps":null`) {
+		t.Errorf("error cell: want mbps:null in JSON, got: %s", got)
+	}
+	if strings.Contains(got, `"mbps":0`) {
+		t.Errorf("error cell: must not serialise as mbps:0, got: %s", got)
+	}
+	// Success cells must remain numeric.
+	if !strings.Contains(got, `"mbps":910.5`) {
+		t.Errorf("success cell: want mbps:910.5 in JSON, got: %s", got)
+	}
+	// Error string must be present.
+	if !strings.Contains(got, `"error":"iperf3 connection refused"`) {
+		t.Errorf("error string missing from JSON: %s", got)
 	}
 }
 

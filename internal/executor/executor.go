@@ -7,6 +7,7 @@ package executor
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -79,7 +80,6 @@ const (
 	// already occupies 5201 on the same hosts (e.g. during e2e tests run alongside
 	// a production DaemonSet).
 	defaultServerPort = 5201
-
 )
 
 // ExecFunc is the signature of the pod-exec layer used by execPair.
@@ -114,10 +114,31 @@ type NodeSnapshot struct {
 //
 // Mbps is the bandwidth that the column node (Target) successfully received
 // from the row node (Source). Error is non-empty when this specific directed
-// link failed; in that case Mbps is 0.
+// link failed; in that case Mbps is zero internally and serialises as null
+// in the JSON response so API consumers can unambiguously distinguish a
+// measurement failure from a genuinely zero-bandwidth link.
 type BandwidthData struct {
 	Mbps  float64 `json:"mbps"`
 	Error string  `json:"error,omitempty"`
+}
+
+// MarshalJSON keeps successful measurements numeric while rendering failed
+// measurements as {"mbps": null, "error": "..."} in API responses.
+func (b BandwidthData) MarshalJSON() ([]byte, error) {
+	type bandwidthDataJSON struct {
+		Mbps  *float64 `json:"mbps"`
+		Error string   `json:"error,omitempty"`
+	}
+
+	var mbps *float64
+	if b.Error == "" {
+		mbps = &b.Mbps
+	}
+
+	return json.Marshal(bandwidthDataJSON{
+		Mbps:  mbps,
+		Error: b.Error,
+	})
 }
 
 // pairResult captures the two directional throughputs produced by a single
@@ -143,7 +164,7 @@ type pairResult struct {
 // matrix[A][B] and matrix[B][A] are independent values populated from the
 // same --bidir exec but representing the two opposite directions of that link.
 type Result struct {
-	Nodes  []string                              `json:"nodes"`
+	Nodes  []string                             `json:"nodes"`
 	Matrix map[string]map[string]*BandwidthData `json:"matrix"`
 }
 
@@ -312,15 +333,19 @@ func podIsReady(pod *corev1.Pod) bool {
 // cancel func is removed from the store when it exits (deferred).
 func (e *Executor) Run(ctx context.Context, taskID string, s *store.Store, snapshot *NodeSnapshot) {
 	// Always remove the cancel func when we exit — whether we completed
-	// naturally, failed, or were cancelled externally via the DELETE endpoint.
+	// naturally, failed, or were cancelled by the caller.
 	defer s.DeleteCancel(taskID)
 
 	started := time.Now()
 
+	// setStatus reads the current task, copies it, updates the copy, and stores
+	// the copy. Never mutates the pointer returned by Get in-place — doing so
+	// would race with concurrent GET readers that hold the same pointer.
 	setStatus := func(status store.Status) {
 		if t, ok := s.Get(taskID); ok {
-			t.Status = status
-			s.Set(taskID, t)
+			updated := *t
+			updated.Status = status
+			s.Set(taskID, &updated)
 		}
 	}
 
@@ -328,21 +353,22 @@ func (e *Executor) Run(ctx context.Context, taskID string, s *store.Store, snaps
 
 	result, err := e.run(ctx, taskID, snapshot)
 
-	t, _ := s.Get(taskID)
-	switch {
-	case err == nil:
-		t.Duration = time.Since(started).String()
-		t.Status = store.StatusCompleted
-		t.Result = result
-	case errors.Is(err, context.Canceled):
-		// Context was cancelled by the DELETE endpoint.
-		t.Status = store.StatusCanceled
-		t.Error = "measurement cancelled by request"
-	default:
-		t.Status = store.StatusFailed
-		t.Error = err.Error()
+	if t, ok := s.Get(taskID); ok {
+		updated := *t
+		switch {
+		case err == nil:
+			updated.Duration = time.Since(started).String()
+			updated.Status = store.StatusCompleted
+			updated.Result = result
+		case errors.Is(err, context.Canceled):
+			updated.Status = store.StatusCanceled
+			updated.Error = "measurement cancelled by request"
+		default:
+			updated.Status = store.StatusFailed
+			updated.Error = err.Error()
+		}
+		s.Set(taskID, &updated)
 	}
-	s.Set(taskID, t)
 }
 
 // run performs the full measurement using the pre-captured node snapshot.
@@ -389,11 +415,11 @@ func (e *Executor) run(ctx context.Context, taskID string, snapshot *NodeSnapsho
 		wg.Wait()
 
 		// If the parent context was cancelled at any point during this round
-		// (DELETE /cancel, server shutdown, etc.), surface that error to the
+		// (store.Cancel call, server shutdown, etc.), surface that error to the
 		// caller now. Without this check, a cancellation that landed during a
 		// round's pair execution would be buried in an individual matrix cell's
 		// error string, and the task would terminate with status=completed even
-		// though the user explicitly cancelled it. The integration test
+		// though the caller explicitly cancelled it. The integration test
 		// TestE2E_CancelMidFlight depends on this status transitioning to
 		// "canceled" rather than "completed".
 		if ctx.Err() != nil {
@@ -551,7 +577,10 @@ func (e *Executor) execPair(ctx context.Context, taskID string, roundIdx int, p 
 		log.Printf("[executor] pair %s→%s Step B attempt %d/%d: stdout=%d bytes err=%v",
 			p.Source, p.Target, attempt, maxFetchAttempts, len(out), fetchErr)
 
-		if len(out) > 0 {
+		// Only accept output when the exec itself succeeded and returned a
+		// non-empty body. A non-nil fetchErr with non-empty stdout means SPDY
+		// dropped mid-transfer (partial JSON) — treat it as empty and retry.
+		if len(out) > 0 && fetchErr == nil {
 			stdout = out
 			break
 		}
