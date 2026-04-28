@@ -30,8 +30,8 @@ type Output struct {
 }
 
 // BidirResult holds the two receiver-side throughput values from one --bidir
-// iperf3 exec — exactly the data needed to populate a directional N×N matrix
-// where matrix[Source][Target] = bandwidth Target received from Source.
+// iperf3 exec — exactly the data needed to populate a directional bandwidth
+// matrix where matrix[Source][Target] = bandwidth Target received from Source.
 //
 // Sender-side counters (sum_sent / sum_sent_bidir_reverse) are intentionally
 // not parsed: on a healthy link they are bounded by the receiver and add no

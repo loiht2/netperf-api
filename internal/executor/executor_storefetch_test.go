@@ -499,9 +499,9 @@ func TestRun_DirectionalMapping_ForwardAndReverseAreIndependent(t *testing.T) {
 	}
 }
 
-// TestRun_DiagonalSelfTestMarker: every node's matrix[X][X] is the canonical
-// self-test placeholder. Mbps must be zero and Error non-empty.
-func TestRun_DiagonalSelfTestMarker(t *testing.T) {
+// TestRun_NoDiagonalInMatrix: matrix[X][X] must be absent for every node.
+// The diagonal was removed — self-test entries must never appear in the output.
+func TestRun_NoDiagonalInMatrix(t *testing.T) {
 	e, fe := newFakeExecutor(t)
 	fe.handler = func(c fakeCall) (string, string, error) {
 		if c.Kind == stepB {
@@ -511,37 +511,22 @@ func TestRun_DiagonalSelfTestMarker(t *testing.T) {
 	}
 
 	nodes := []string{"10.0.0.1", "10.0.0.2", "10.0.0.3"}
-	task := runOnce(t, e, snap(nodes...), "diagonal")
+	task := runOnce(t, e, snap(nodes...), "no-diagonal")
 	if task.Status != store.StatusCompleted {
 		t.Fatalf("status=%s err=%s", task.Status, task.Error)
 	}
 	res := task.Result.(*executor.Result)
 
 	for _, ip := range nodes {
-		diag := res.Matrix[ip][ip]
-		if diag == nil {
-			t.Errorf("matrix[%s][%s] missing — diagonal should be populated", ip, ip)
-			continue
-		}
-		if diag.Mbps != 0 {
-			t.Errorf("matrix[%s][%s].Mbps=%v, want 0", ip, ip, diag.Mbps)
-		}
-		if diag.Error == "" {
-			t.Errorf("matrix[%s][%s].Error empty, want self-test marker", ip, ip)
-		}
-		if !strings.Contains(strings.ToLower(diag.Error), "self") {
-			t.Errorf("matrix[%s][%s].Error=%q, want it to mention 'self'", ip, ip, diag.Error)
-		}
-		if diag.Error != executor.SelfTestErrorMessage {
-			t.Errorf("matrix[%s][%s].Error=%q, want exactly the exported constant %q",
-				ip, ip, diag.Error, executor.SelfTestErrorMessage)
+		if cell, exists := res.Matrix[ip][ip]; exists {
+			t.Errorf("matrix[%s][%s] must be absent (no diagonal), got %+v", ip, ip, cell)
 		}
 	}
 }
 
-// TestRun_MatrixIsCompleteNxN: total cells = N*N (N pair cells + N diagonal).
-// Each row has exactly N entries.  This is the strictest matrix-shape test.
-func TestRun_MatrixIsCompleteNxN(t *testing.T) {
+// TestRun_MatrixShapeNxNMinus1: total cells = N*(N-1). Each row has exactly
+// N-1 entries (all peers except self). No diagonal entry is present.
+func TestRun_MatrixShapeNxNMinus1(t *testing.T) {
 	tests := []struct {
 		name string
 		n    int
@@ -576,18 +561,19 @@ func TestRun_MatrixIsCompleteNxN(t *testing.T) {
 			if got := len(res.Matrix); got != tc.n {
 				t.Errorf("rows=%d, want %d", got, tc.n)
 			}
+			wantPerRow := tc.n - 1
 			totalCells := 0
 			for src, row := range res.Matrix {
-				if len(row) != tc.n {
-					t.Errorf("matrix[%s] has %d cells, want %d (N including diagonal)", src, len(row), tc.n)
+				if cell, exists := row[src]; exists {
+					t.Errorf("matrix[%s][%s] must be absent (diagonal forbidden), got %+v", src, src, cell)
 				}
-				if row[src] == nil {
-					t.Errorf("matrix[%s][%s] missing diagonal", src, src)
+				if len(row) != wantPerRow {
+					t.Errorf("matrix[%s] has %d cells, want %d (N-1, no diagonal)", src, len(row), wantPerRow)
 				}
 				totalCells += len(row)
 			}
-			if want := tc.n * tc.n; totalCells != want {
-				t.Errorf("total cells=%d, want N*N=%d for N=%d", totalCells, want, tc.n)
+			if want := tc.n * (tc.n - 1); totalCells != want {
+				t.Errorf("total cells=%d, want N*(N-1)=%d for N=%d", totalCells, want, tc.n)
 			}
 		})
 	}
@@ -1266,13 +1252,16 @@ func TestRun_OddNodeCount_DummyPaddingHandled(t *testing.T) {
 		t.Fatalf("status=%s err=%s", task.Status, task.Error)
 	}
 	res := task.Result.(*executor.Result)
-	// Verify the matrix is fully populated (3 rows × 3 cells = 9 cells, with diagonals).
+	// N=3 → 3 rows × 2 peers each = 6 cells; no diagonal entries.
 	totalCells := 0
-	for _, row := range res.Matrix {
+	for src, row := range res.Matrix {
+		if _, exists := row[src]; exists {
+			t.Errorf("diagonal matrix[%s][%s] must be absent", src, src)
+		}
 		totalCells += len(row)
 	}
-	if totalCells != 9 {
-		t.Errorf("total cells=%d, want 9 for N=3 (3×3 incl. self)", totalCells)
+	if totalCells != 6 {
+		t.Errorf("total cells=%d, want 6 for N=3 (N*(N-1), no diagonal)", totalCells)
 	}
 }
 

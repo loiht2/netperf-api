@@ -398,46 +398,30 @@ func TestE2E_FullMeasurementCycle(t *testing.T) {
 	t.Logf("measurement finished in %s", task.Duration)
 	t.Logf("nodes tested: %v", result.Nodes)
 
-	// 2. Matrix invariants for a True Directional N×N matrix (now including
-	//    a self-test diagonal for completeness):
-	//    - Exactly N rows (one per source).
-	//    - Each row has N columns: N-1 measured pairs + 1 diagonal self-test cell.
-	//    - Total entries = N*N — every ordered pair appears once.
-	//    - Diagonal cells contain the SelfTestErrorMessage marker.
+	// 2. Matrix shape: N rows, N-1 columns each, no diagonal entries.
+	//    Total cells = N*(N-1) directed links.
 	if got := len(result.Matrix); got != nNodes {
 		t.Errorf("want %d matrix rows, got %d", nNodes, got)
 	}
 	totalCells := 0
+	wantPerRow := nNodes - 1
 	for src, row := range result.Matrix {
-		diag, hasDiag := row[src]
-		if !hasDiag {
-			t.Errorf("diagonal cell matrix[%s][%s] missing", src, src)
-		} else {
-			if diag.Mbps != 0 {
-				t.Errorf("matrix[%s][%s].Mbps=%v, want 0 on diagonal", src, src, diag.Mbps)
-			}
-			if diag.Error == "" {
-				t.Errorf("matrix[%s][%s].Error empty, want self-test marker", src, src)
-			}
+		if cell, exists := row[src]; exists {
+			t.Errorf("diagonal matrix[%s][%s] must be absent, got %+v", src, src, cell)
 		}
-		if len(row) != nNodes {
-			t.Errorf("row matrix[%s]: want %d cells (N incl. diagonal), got %d", src, nNodes, len(row))
+		if len(row) != wantPerRow {
+			t.Errorf("row matrix[%s]: want %d cells (N-1, no diagonal), got %d", src, wantPerRow, len(row))
 		}
 		totalCells += len(row)
 	}
-	if want := nNodes * nNodes; totalCells != want {
-		t.Errorf("want %d total cells (N*N for %d nodes incl. diagonal), got %d",
-			want, nNodes, totalCells)
+	if want := nNodes * (nNodes - 1); totalCells != want {
+		t.Errorf("want %d total cells (N*(N-1) for %d nodes), got %d", want, nNodes, totalCells)
 	}
 
-	// 3. Per-cell assertions: every off-diagonal directed link must be > 0 Mbps
-	// and free of errors. matrix[A][B] / matrix[B][A] must be independent values
-	// (NOT silently duplicated, which was the redundancy in the old design).
+	// 3. Every directed link must carry > 0 Mbps and no error.
+	// matrix[A][B] and matrix[B][A] are independent measurements.
 	for src, row := range result.Matrix {
 		for tgt, cell := range row {
-			if tgt == src {
-				continue // self-test diagonal validated above
-			}
 			t.Logf("  %s → %s : %.2f Mbps", src, tgt, cell.Mbps)
 			if cell.Error != "" {
 				t.Errorf("matrix[%s][%s]: unexpected error: %s", src, tgt, cell.Error)

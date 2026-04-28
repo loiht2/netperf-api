@@ -80,10 +80,6 @@ const (
 	// a production DaemonSet).
 	defaultServerPort = 5201
 
-	// SelfTestErrorMessage is written into matrix[X][X] for every node X.
-	// It is exposed so consumers can recognise the canonical "node measures
-	// itself" placeholder rather than special-casing diagonal absence.
-	SelfTestErrorMessage = "self-test (no measurement performed)"
 )
 
 // ExecFunc is the signature of the pod-exec layer used by execPair.
@@ -137,13 +133,13 @@ type pairResult struct {
 
 // Result is the final payload stored in the task once the run completes.
 //
-// Matrix is a directional N×N adjacency matrix:
+// Matrix is a directional adjacency map keyed by [Source][Target].
 //
 //	row    = sender (Source)
 //	column = receiver (Target)
 //	cell   = bandwidth that Target successfully received from Source (Mbps)
 //
-// Diagonal cells (matrix[X][X]) are absent — a node never tests against itself.
+// Each source row contains N-1 entries — one per peer, never itself.
 // matrix[A][B] and matrix[B][A] are independent values populated from the
 // same --bidir exec but representing the two opposite directions of that link.
 type Result struct {
@@ -367,16 +363,10 @@ func (e *Executor) run(ctx context.Context, taskID string, snapshot *NodeSnapsho
 	log.Printf("[executor] schedule: %d rounds for %d nodes", len(sched), len(nodeIPs))
 
 	// ── Allocate the directional matrix ──────────────────────────────────────
-	// One row per node, each row is an inner map keyed by Target. The diagonal
-	// cell matrix[X][X] is pre-populated with a self-test marker so consumers
-	// receive a complete N×N structure without having to special-case absence.
-	// This pre-population happens entirely on the calling goroutine before any
-	// pair worker is launched, so there is no write race against execPair.
+	// One row per node; each row will hold N-1 measured entries (all peers).
 	matrix := make(map[string]map[string]*BandwidthData, len(nodeIPs))
 	for _, ip := range nodeIPs {
-		row := make(map[string]*BandwidthData, len(nodeIPs))
-		row[ip] = &BandwidthData{Error: SelfTestErrorMessage}
-		matrix[ip] = row
+		matrix[ip] = make(map[string]*BandwidthData, len(nodeIPs)-1)
 	}
 
 	for roundIdx, round := range sched {

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# audit.sh — Automated N×N bandwidth audit loop for netperf-api
+# audit.sh — Automated full-mesh bandwidth audit loop for netperf-api
 #
 # Prerequisites:
 #   curl  (apt install curl  / brew install curl)
@@ -24,25 +24,29 @@ set -uo pipefail
 # ── Configuration (override via environment) ─────────────────────────────────
 API_URL="${API_URL:-http://localhost:8080/api/v1/network-measure}"
 LOG_FILE="${LOG_FILE:-bandwidth_audit.log}"
-MAX_ITERATIONS="${MAX_ITERATIONS:-200}"
+MAX_ITERATIONS="${MAX_ITERATIONS:-2}"
 
 # Max poll attempts per task (5 s each → 120 × 5 = 10 min timeout per iteration)
 MAX_POLL_ATTEMPTS=120
 
 # ── Logging helper ────────────────────────────────────────────────────────────
+# Appends one NDJSON record per iteration:
+#   {"iteration":N,"timestamp":"…Z","task_id":"…","matrix":{…}}
+# Each line is a complete, valid JSON object — pipe the file through
+# `jq .` for pretty-print or `jq 'select(.iteration==5)'` to filter.
 write_log_entry() {
     local iter="$1"
     local ts="$2"
     local task_id="$3"
     local matrix_json="$4"
 
-    {
-        printf "\n"
-        printf "========== ITERATION %s | %s ==========\n" "$iter" "$ts"
-        printf "Task ID: %s\n" "$task_id"
-        printf "%s\n" "$matrix_json"
-        printf "\n"
-    } >> "$LOG_FILE"
+    jq -c -n \
+        --argjson iteration "$iter" \
+        --arg     timestamp "$ts" \
+        --arg     task_id   "$task_id" \
+        --argjson matrix    "$matrix_json" \
+        '{iteration: $iteration, timestamp: $timestamp, task_id: $task_id, matrix: $matrix}' \
+        >> "$LOG_FILE"
 }
 
 # ── Startup banner ────────────────────────────────────────────────────────────
@@ -58,7 +62,7 @@ echo ""
 # ── Main loop ─────────────────────────────────────────────────────────────────
 for i in $(seq 1 "$MAX_ITERATIONS"); do
 
-    TIMESTAMP=$(date "+%Y-%m-%d %H:%M:%S")
+    TIMESTAMP=$(date -u "+%Y-%m-%dT%H:%M:%SZ")
     echo "---------- Iteration $i / $MAX_ITERATIONS | $TIMESTAMP ----------"
 
     # ── 1. Trigger measurement (POST) ────────────────────────────────────────
