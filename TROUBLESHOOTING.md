@@ -418,7 +418,7 @@ The iperf3 output is redirected to a file in `/tmp` (backed by `emptyDir` — se
 cat /tmp/iperf_<taskID>_R<round>_<src>_<dst>.json
 ```
 
-This opens a fresh SPDY connection to retrieve the file. If the cat stream itself is dropped (a second Tailscale flap) or the file is not yet ready, the fetch is retried up to 3 more times with a 3-second wait between attempts.
+This opens a fresh SPDY connection to retrieve the file. If the cat stream itself is dropped (a second Tailscale flap) or the file is not yet ready, the fetch is retried up to 3 more times with a 1-second wait between attempts. Each fetch attempt is capped at 3 seconds.
 
 **Step C — Cleanup (always runs via `defer`)**
 

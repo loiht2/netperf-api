@@ -143,7 +143,7 @@ rounds = N − 1  (N even)   or   N  (N odd)
 estimated_duration_seconds = rounds × 15
 ```
 
-The 15-second-per-round constant is: **10 s** (`iperf3 -t 10`) + **5 s** (inter-round cooldown). This is the happy-path estimate and also the typical case under the Store-and-Fetch architecture: Step A takes ~10 s (iperf3 completes normally and the stream closes), followed by an immediate Step B fetch. In the event of a Tailscale flap during Step A, the pair still takes ~11 s total (the minimum file-wait), so the round wall-clock is unaffected. Step B retries add at most 3 × (10 + 3) = 39 s to a single pair in the pathological case where every cat stream also drops, but this is far outside the norm.
+The 15-second-per-round constant is: **10 s** (`iperf3 -t 10`) + **5 s** (inter-round cooldown). This is the happy-path estimate and also the typical case under the Store-and-Fetch architecture: Step A takes ~10 s (iperf3 completes normally and the stream closes), followed by an immediate Step B fetch. In the event of a Tailscale flap during Step A, the pair still takes ~11 s total (the minimum file-wait), so the round wall-clock is unaffected. A fully exhausted Step B fetch path is capped at roughly 15 s: 4 cat attempts × 3 s each, plus 3 retry waits × 1 s.
 
 ---
 

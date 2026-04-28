@@ -58,14 +58,14 @@ const (
 	// iperfFetchTimeout is the per-attempt deadline for the Step B cat exec.
 	// Short because cat on an existing file returns immediately; the timeout
 	// guards only against SPDY negotiation hanging.
-	iperfFetchTimeout = 10 * time.Second
+	iperfFetchTimeout = 3 * time.Second
 
 	// iperfFetchRetries is the number of additional fetch attempts after the
 	// initial one. Total attempts = iperfFetchRetries + 1 = 4.
 	iperfFetchRetries = 3
 
 	// iperfFetchRetryWait is the pause between consecutive Step B attempts.
-	iperfFetchRetryWait = 3 * time.Second
+	iperfFetchRetryWait = 1 * time.Second
 
 	// iperfCleanupTimeout caps the Step C rm -f exec so a stuck cleanup
 	// does not block the goroutine indefinitely.
@@ -191,7 +191,7 @@ func (e *Executor) SetExecFunc(fn ExecFunc) {
 }
 
 // SetTimingForTesting reduces the inter-step waits so unit tests do not have
-// to spend 11 s on every Step A or 3 s on every fetch retry. A zero value for
+// to spend 11 s on every Step A or 1 s on every fetch retry. A zero value for
 // any parameter restores the production default for that timing. Production
 // code never calls this.
 func (e *Executor) SetTimingForTesting(fileWait, fetchRetryWait, roundCooldown time.Duration) {
